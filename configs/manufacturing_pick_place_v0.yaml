@@ -1,0 +1,56 @@
+task_family: manufacturing_pick_place_v0
+base_env_id: PickCube-v1
+
+description: >
+  Manufacturing-style language-conditioned pick-and-place task wrapper.
+  The initial implementation uses ManiSkill PickCube-v1 as the base environment,
+  while adding task-level language instructions and manufacturing semantics.
+
+objects:
+  - id: red_component
+    display_name: red component
+    semantic_type: component
+    description: A small component that must be picked by the robot.
+  - id: blue_component
+    display_name: blue component
+    semantic_type: component
+    description: A distractor or alternate component for instruction variation.
+  - id: bolt_like_part
+    display_name: bolt-like part
+    semantic_type: fastener
+    description: A manufacturing-style part alias for future asset replacement.
+
+targets:
+  - id: left_fixture
+    display_name: left fixture
+    semantic_type: fixture
+    description: Target fixture for placement.
+  - id: right_fixture
+    display_name: right fixture
+    semantic_type: fixture
+    description: Alternate fixture for instruction variation.
+  - id: inspection_tray
+    display_name: inspection tray
+    semantic_type: tray
+    description: Target tray for inspection-style workflow.
+
+instruction_templates:
+  - "Pick the {object_name} and place it into the {target_name}."
+  - "Move the {object_name} to the {target_name}."
+  - "Grasp the {object_name}, then put it in the {target_name}."
+  - "Place the {object_name} at the {target_name} for inspection."
+
+evaluation_metrics:
+  - task_success
+  - episode_return
+  - num_steps
+  - completion_time
+  - placement_error
+  - collision_count
+  - action_smoothness
+  - retry_count
+
+notes:
+  - M1 does not yet modify the physical ManiSkill environment.
+  - M1 adds language/task metadata and establishes the VLA-style data contract.
+  - M2 will use this task contract to generate demonstrations.
