@@ -19,6 +19,7 @@ RUN python -m pip install --upgrade pip && \
       pyyaml \
       rich \
       imageio \
-      imageio-ffmpeg
+      imageio-ffmpeg \
+      h5py
 
 CMD ["/bin/bash"]
