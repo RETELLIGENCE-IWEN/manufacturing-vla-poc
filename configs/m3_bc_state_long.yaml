@@ -1,0 +1,19 @@
+dataset_dir: outputs/m2_expert_dataset_100
+run_dir: runs/m3_bc_state_long
+
+seed: 42
+
+training:
+  batch_size: 256
+  num_epochs: 10000
+  learning_rate: 0.0003
+  weight_decay: 0.000001
+  grad_clip_norm: 1.0
+
+model:
+  hidden_dims: [256, 256, 128]
+  activation: relu
+  dropout: 0.05
+
+logging:
+  print_every_epochs: 50
