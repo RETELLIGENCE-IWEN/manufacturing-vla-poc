@@ -59,6 +59,10 @@ M3.9H  Completed — force_grip_while_far inference heuristic
 M4     Completed — Language-conditioned BC infrastructure (CLIP-text + state)
 M5     Completed — Multi-task (PickCube + PushCube + PullCube) language-conditioned BC
 M5.1   Completed — Auxiliary task_id classification loss (policy now actually uses the instruction)
+M6     Completed — VLA: state + CLIP-text + CLIP-vision policy
+M6.1   Completed — PushCube settle solver + late_weight 8 (PushCube success 13%→50%)
+M6.2   Completed — PullCube settle solver + xy/sustained metrics + ignore-termination eval flag
+                   (PullCube success 30%→43%; multi-task capacity-sharing trade-off documented)
 ```
 
 BC base summary:
@@ -905,12 +909,187 @@ See [docs/m5_1_aux_loss.md](docs/m5_1_aux_loss.md) for the full analysis.
 
 ---
 
-## M6 — Planned: Vision (VLA-style observation)
+## M6 — VLA: state + CLIP-text + CLIP-vision
 
-With the language path now load-bearing, the natural next step is to swap
-or augment the state observation with RGB renderings and reuse the CLIP
-vision tower (frozen, then optionally fine-tuned). This is the genuine
-VLA setting: rgb image + instruction → action.
+M6 wires the CLIP vision tower into the M5.1 multi-task policy. Each
+transition now feeds *three* inputs to the BC head:
+
+```text
+state_obs   (57)  + progress (1) + prev_action (8)   = obs (66)
+lang_emb    (512)  ← frozen CLIPTextModel.pooler_output(instruction)
+image_emb   (768)  ← frozen CLIPVisionModel.pooler_output(env.render())
+
+policy_input = concat(obs, lang_proj(lang_emb), image_proj(image_emb))
+             = 66 + 64 + 128
+             = 258
+```
+
+`task_head` (auxiliary classification) stays on top of `lang_proj` only,
+to keep the M5.1 instruction-following pressure intact.
+
+Pipeline:
+
+```bash
+# Precompute per-step CLIP-vision embeddings by replaying every expert traj
+# (uses episode_seed from H5 metadata; renders at 224x224 to match CLIP input)
+python scripts/m6_add_image_embeddings.py \
+  --in-dir outputs/m5_multitask_lang_phase_aware_dataset \
+  --out-dir outputs/m6_multitask_vla_dataset
+
+# Train VLA: BC weighted-MSE + aux task_id cross-entropy
+python scripts/m6_train_vla_lang_aux.py --config configs/m6_vla_aux_v0.yaml
+
+# Closed-loop eval: instruction is encoded once; image is encoded every step
+python scripts/m6_eval_closedloop_vla.py \
+  --env-id PickCube-v1 \
+  --model runs/m6_vla_aux_v0/best_model.pt \
+  --normalization runs/m6_vla_aux_v0/normalization_stats.npz \
+  --expert-action-bounds outputs/m6_multitask_vla_dataset/action_bounds.json \
+  --instruction "Pick the bolt-like part and place it at the left fixture." \
+  --skip-random \
+  --out-dir runs/m6_vla_aux_v0/eval_pickcube_pick
+```
+
+Training result:
+
+```text
+best_epoch          : 269 / 500
+best_val_mse_norm   : 0.00437   (M5.1: 0.00384; M5: 0.00426)
+best_val_task_acc   : 1.000
+image_emb_dim       : 768
+image_proj_dim      : 128
+```
+
+### Closed-loop swap matrix — M5.1 vs M6
+
+30 episodes per cell, seed=3000, phase_horizon=80, max_steps=120.
+
+| env       | instruction      | M5.1 success | M6 success | M5.1 grasp | **M6 grasp** | M5.1 min_dist | M6 min_dist |
+| --        | --               | --           | --         | --         | --           | --            | --          |
+| PickCube  | Pick (matched)   | 0.00         | 0.00       | 0.07       | **0.30** ⭐   | 0.192         | 0.187       |
+| PickCube  | Push (swap)      | 0.00         | 0.00       | **0.00**   | 0.07         | 0.207         | 0.202       |
+| PickCube  | Pull (swap)      | 0.00         | 0.00       | **0.00**   | 0.10         | 0.203         | 0.199       |
+| PushCube  | Push (matched)   | **0.20**     | 0.13       | 0.00       | 0.00         | 0.173         | 0.166       |
+| PushCube  | Pick (swap)      | 0.00         | 0.00       | 0.00       | 0.00         | 0.201         | 0.195       |
+| PullCube  | Pull (matched)   | **0.33**     | 0.30       | 0.00       | 0.00         | 0.163         | 0.163       |
+
+### Trade-off observed
+
+- ✅ **Vision adds spatial competence:** PickCube grasp rate jumps **7% → 30%**.
+  `min_cube_goal_dist` improves in every cell. `mean_return` rises in every
+  cell. The policy gets to the cube faster and more often.
+- ❌ **Vision dilutes instruction following:** in PickCube + swap-instruction,
+  grasp goes from 0% → 7-10%. The policy now sees "cube is there" from the
+  image and partially overrides the instruction. PushCube matched-success
+  also drops 20% → 13%.
+
+This is the classic vision/language shortcut tension: with two strong
+modalities, gradient descent will exploit whichever is locally easier. M6
+demonstrates the full VLA stack works end-to-end (real image inputs at
+inference time, frozen CLIP towers, joint BC + auxiliary classification)
+while making the trade-off visible.
+
+See [docs/m6_vla.md](docs/m6_vla.md) for the full pipeline + analysis.
+
+---
+
+## M6.1 — PushCube settle solver + stricter metrics
+
+Watching the M6 success videos revealed that ManiSkill's native success
+criterion is lax: PushCube/PullCube fire `success=True` the instant the
+cube center crosses the goal-region boundary (`xy_distance < 0.1`), and
+the env terminates. The cube never settles. PickCube's `is_obj_placed`
+is similarly distance-only; one fleeting moment within 0.025 m of the goal
+fires it.
+
+Diagnosis after expert-video review:
+
+- **PickCube expert** settles the cube cleanly inside the goal_site.
+- **PullCube expert** also settles the cube near the goal_region center.
+- **PushCube expert** stops at the boundary — it inherits the lax success
+  criterion.
+
+Two fixes in M6.1:
+
+1. [scripts/m6_generate_multitask_expert_v1.py](scripts/m6_generate_multitask_expert_v1.py)
+   adds a third motion-planning stage to PushCube (`tcp = goal_region.x - 0.06`)
+   so the cube ends up near the goal center, not on the boundary.
+2. [configs/m6_vla_aux_v1.yaml](configs/m6_vla_aux_v1.yaml) raises
+   `late_weight: 4 → 8` so the BC head pays more attention to the
+   late-trajectory settle behavior.
+
+Result on PushCube + Push (matched), 30 episodes, seed=3000:
+
+| Metric                 | M6 (v0) | **M6.1 (v1)** |
+| --                     | --      | --            |
+| success_rate_once      | 0.13    | **0.50**      |
+| mean_min_xy_dist       | —       | 0.144         |
+
+Debug video (`runs/m6_vla_aux_v1/debug_video/PushCube-v1_seed_3029/...`,
+recorded with `--ignore-termination`) shows the policy pushing the cube
+to `min_cube_goal_dist = 0.027` (27 mm), past the boundary toward the
+goal center.
+
+Stricter eval metrics added to
+[scripts/m6_eval_closedloop_vla.py](scripts/m6_eval_closedloop_vla.py):
+
+```text
+final_cube_xy_goal_dist      (xy distance at final step)
+min_cube_xy_goal_dist        (best xy distance reached)
+xy_in_{100,50,25}mm_steps    (step counts inside successive radii)
+xy_sustained_{100,50,25}mm_10 (cube spent ≥10 consecutive steps in goal)
+```
+
+## M6.2 — PullCube settle solver + xy/sustained metrics
+
+Same idea applied to PullCube ([scripts/m6_generate_multitask_expert_v2.py](scripts/m6_generate_multitask_expert_v2.py)):
+add a third pulling stage to bring the cube toward the goal_region center.
+
+Stack of changes in v2:
+
+- PushCube settle (from v1)
+- PullCube settle (new in v2)
+- `late_weight: 8` (from v1)
+- `--ignore-termination` flag on eval so the policy can be observed past
+  the moment native success fires
+
+Result on PullCube + Pull (matched), 30 episodes, seed=3000:
+
+| Metric                 | M6.1 (v1) | **M6.2 (v2)** |
+| --                     | --        | --            |
+| success_rate_once      | 0.30      | **0.43**      |
+| mean_min_xy_dist       | 0.167     | **0.154**     |
+
+### v0 → v1 → v2 scorecard
+
+| Model | PickCube grasp | PushCube success | PullCube success |
+| --    | --             | --               | --               |
+| v0    | **0.30**       | 0.13             | 0.30             |
+| v1    | 0.17           | **0.50**         | 0.30             |
+| v2    | 0.00 / 0.13*   | 0.30             | **0.43**         |
+
+(\*: with the `--force-grip-while-far` heuristic.)
+
+Each variant is best at a different task. This is the textbook **multi-task
+capacity-sharing trade-off** — a single shared MLP can't simultaneously
+strengthen three task-specific late-phase behaviors when capacity is fixed.
+The findings are documented in [docs/m6_1_settle.md](docs/m6_1_settle.md).
+
+---
+
+## M7+ — Possible next steps
+
+- **M7a: Image-only VLA** — drop `state_obs`, force the policy to localize
+  cube/goal from the image. Hardest setting, closest to "real VLA".
+- **M7b: Vision-language alignment loss** — add a contrastive or alignment
+  objective so image_emb and lang_emb co-influence the action rather than
+  competing.
+- **M7c: Multi-target instructions** — e.g. "Push to the **left** goal" vs
+  "to the **right** goal" within the same env. Tests fine-grained
+  instruction conditioning beyond verb-level.
+- **M7d: Per-task heads** — keep the shared trunk but add a small per-task
+  output head selected by `task_id`, so capacity sharing doesn't force the
+  v0/v1/v2 trade-off observed here.
 
 ---
 
