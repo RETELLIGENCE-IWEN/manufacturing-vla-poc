@@ -1,0 +1,32 @@
+dataset_dir: outputs/m6_multitask_vla_dataset_v2
+run_dir: runs/m7_diffusion_v0
+
+seed: 42
+
+training:
+  batch_size: 256
+  num_epochs: 200
+  learning_rate: 0.0003
+  weight_decay: 0.000001
+  grad_clip_norm: 1.0
+
+model:
+  hidden_dim: 256
+  num_blocks: 3
+  cond_dim: 256
+
+diffusion:
+  action_chunk: 8
+  num_train_timesteps: 100
+
+lang:
+  lang_proj_dim: 64
+
+image:
+  image_proj_dim: 128
+
+aux:
+  aux_weight: 1.0
+
+logging:
+  print_every_epochs: 10

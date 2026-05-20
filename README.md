@@ -63,6 +63,8 @@ M6     Completed — VLA: state + CLIP-text + CLIP-vision policy
 M6.1   Completed — PushCube settle solver + late_weight 8 (PushCube success 13%→50%)
 M6.2   Completed — PullCube settle solver + xy/sustained metrics + ignore-termination eval flag
                    (PullCube success 30%→43%; multi-task capacity-sharing trade-off documented)
+M7     Completed — Diffusion Policy (Chi et al. 2023) on the multi-task VLA dataset
+M7.1   Completed — Diffusion Policy with 500 epochs + tuned DDIM eval (PushCube 30%→47%)
 ```
 
 BC base summary:
@@ -1077,19 +1079,112 @@ The findings are documented in [docs/m6_1_settle.md](docs/m6_1_settle.md).
 
 ---
 
-## M7+ — Possible next steps
+## M7 — Diffusion Policy on multi-task VLA dataset
 
-- **M7a: Image-only VLA** — drop `state_obs`, force the policy to localize
+The deterministic BC head was hitting a multi-task capacity ceiling (see M6.2).
+M7 replaces it with a **Diffusion Policy** (Chi et al. 2023): the network
+predicts noise on top of a noised action chunk instead of a single action.
+
+```text
+network = ConditionalUnet1D-style block stack with FiLM conditioning
+input   = noisy_action_chunk[T_chunk, action_dim] + timestep + cond
+cond    = MLP(concat(obs, lang_proj(lang_emb), image_proj(image_emb)))
+loss    = MSE(eps_pred, eps) + aux_weight * CE(task_logits, task_id)
+        (eps-prediction DDPM, squaredcos beta schedule, T=100)
+
+inference = DDIM, receding horizon (sample 8 actions, execute K, replan)
+```
+
+Code:
+[scripts/m7_train_diffusion_policy.py](scripts/m7_train_diffusion_policy.py),
+[scripts/m7_eval_closedloop_diffusion.py](scripts/m7_eval_closedloop_diffusion.py),
+[scripts/m7_record_diffusion_debug.py](scripts/m7_record_diffusion_debug.py),
+[configs/m7_diffusion_v0.yaml](configs/m7_diffusion_v0.yaml),
+[configs/m7_diffusion_v1.yaml](configs/m7_diffusion_v1.yaml).
+
+### M7 v0 (200 epoch, action_exec=4, infer_steps=16)
+
+```text
+best_val_diffusion_mse : 0.0126
+best_val_task_acc      : 1.000
+```
+
+Closed-loop versus M6.2 BC v2 (30 ep per cell, seed=3000, max_steps=120):
+
+| env       | instr             | v2 BC | v0 M7  | notes                                          |
+| --        | --                | --    | --     | --                                             |
+| PickCube  | Pick (matched)    | 0.00  | 0.00   | grasp drops 0.13 → 0.00                        |
+| PushCube  | Push (matched)    | 0.30  | 0.30   | parity                                         |
+| PullCube  | Pull (matched)    | 0.43  | 0.30   | regression                                     |
+| PickCube  | Push (swap)       | 0.00  | 0.00   | parity                                         |
+| PullCube  | Pick (swap)       | 0.13  | 0.17   | slight instruction-following weakening         |
+
+Diffusion v0 did not exceed BC v2 — likely under-trained and/or chunk
+horizon mismatched for fine grasp behavior.
+
+### M7.1 v1 (500 epoch, action_exec=2, infer_steps=24)
+
+Tuned hyperparameters: longer training, more frequent receding-horizon
+replanning (every 2 steps instead of every 4), more DDIM steps for higher
+sampling quality.
+
+```text
+best_val_diffusion_mse : 0.0093   (vs v0: 0.0126; -26%)
+best_val_task_acc      : 1.000
+```
+
+Closed-loop versus BC v2 and M7 v0:
+
+| env       | instr             | v2 BC | v0 M7 | **v1 M7.1** |
+| --        | --                | --    | --    | --          |
+| PickCube  | Pick (matched)    | 0.00  | 0.00  | 0.00        |
+| **PushCube** | **Push (matched)** | 0.30  | 0.30  | **0.47** ⭐  |
+| PullCube  | Pull (matched)    | 0.43  | 0.30  | 0.23        |
+| PickCube  | Push (swap)       | 0.00  | 0.00  | 0.00        |
+| PullCube  | Pick (swap)       | 0.13  | 0.17  | 0.20        |
+
+`mean_return` is consistently higher for the diffusion policy across every
+cell (×1.5 to ×2.1 vs BC). The diffusion policy keeps interacting with the
+cube through the whole episode, while the BC head tends to freeze after
+a few steps.
+
+### What this milestone showed
+
+- ✅ Full **Diffusion Policy pipeline** (1D U-Net + DDPM training +
+  DDIM receding-horizon inference + auxiliary task classification) works
+  end-to-end on the multi-task VLA dataset.
+- ✅ **First clean win over BC on PushCube** (30% → 47%) once trained long
+  enough and tuned with frequent receding-horizon replanning.
+- ✅ Diffusion produces more active policies (higher `mean_return`
+  everywhere) — likely the multi-modal action distribution is keeping
+  reasonable actions available even after the M6 BC would have collapsed
+  to a static state.
+- ❌ **No universal improvement**: M7.1 helps PushCube, hurts PullCube,
+  PickCube grasp still flat. The multi-task capacity-sharing trade-off
+  from M6.2 (each variant best at a different task) **is preserved**, just
+  shifted: now M7.1 owns PushCube while BC v2 still owns PullCube and
+  PickCube.
+
+See [docs/m7_diffusion.md](docs/m7_diffusion.md) for the full design + analysis.
+
+---
+
+## M8+ — Possible next steps
+
+- **M8a: Image-only VLA** — drop `state_obs`, force the policy to localize
   cube/goal from the image. Hardest setting, closest to "real VLA".
-- **M7b: Vision-language alignment loss** — add a contrastive or alignment
+- **M8b: Vision-language alignment loss** — add a contrastive or alignment
   objective so image_emb and lang_emb co-influence the action rather than
   competing.
-- **M7c: Multi-target instructions** — e.g. "Push to the **left** goal" vs
+- **M8c: Multi-target instructions** — e.g. "Push to the **left** goal" vs
   "to the **right** goal" within the same env. Tests fine-grained
   instruction conditioning beyond verb-level.
-- **M7d: Per-task heads** — keep the shared trunk but add a small per-task
+- **M8d: Per-task heads** — keep the shared trunk but add a small per-task
   output head selected by `task_id`, so capacity sharing doesn't force the
-  v0/v1/v2 trade-off observed here.
+  v0/v1/v2 trade-off observed here and in M7.
+- **M8e: OpenVLA / Octo fine-tune** — use a pre-trained foundation policy
+  as the backbone instead of training from scratch. Strongest portfolio
+  narrative; GPU memory + inference latency cost to verify.
 
 ---
 
