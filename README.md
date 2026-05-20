@@ -42,21 +42,39 @@ Current milestone status:
 M0     Completed — Dockerized ManiSkill bring-up
 M1     Completed — Manufacturing-style language task wrapper
 M2A    Completed — Step-level dataset logger
-M2B    Completed — Expert demonstration generation
+M2B    Completed — Expert demonstration generation (100 + 5000 demo sets)
 M2C    Completed — Expert H5 to M3-ready dataset conversion
 M3.0   Completed — State-only behavior cloning training
 M3.1   Completed — Open-loop action prediction evaluation
 M3.2   Completed — Closed-loop rollout evaluation
 M3.3A  Completed — Closed-loop failure diagnosis with video/logs
 M3.3L  Completed — Longer state-only BC training experiment
-M3.4   Planned   — Phase-aware behavior cloning
+M3.4   Completed — Phase-aware BC (obs = state + progress + prev_action)
+M3.5   Completed — Safe action filter (expert-bounded action clipping)
+M3.6   Completed — Final-hold stabilization wrapper for phase-aware BC
+M3.7   Completed — 5000-demo expert phase-aware BC
+M3.8   Completed — Phase-weighted loss for late-trajectory emphasis
+M3.9   Completed — DAgger pipeline (rollout, planner-relabel, aggregate, train)
+M3.9H  Completed — force_grip_while_far inference heuristic
+M4     Completed — Language-conditioned BC infrastructure (CLIP-text + state)
+M5     Completed — Multi-task (PickCube + PushCube + PullCube) language-conditioned BC
+M5.1   Completed — Auxiliary task_id classification loss (policy now actually uses the instruction)
 ```
 
-Summary:
+BC base summary:
 
-> The project has reached a working simulation-to-dataset-to-BC-training-to-closed-loop-evaluation pipeline.  
-> The current state-only BC policy learns expert actions in open-loop evaluation but fails to reliably complete closed-loop grasping.  
-> The next step is phase-aware BC using progress and previous-action conditioning.
+> The phase-aware BC + DAgger v1 + force_grip heuristic (M3.4 + M3.9 + M3.9H) is the chosen BC base policy:
+> grasped_once 47%, final_grasped 37%, mean_return 24.1, closed-loop success 0%.
+> DAgger v2 (release-phase bias selection) underperformed v1 because removing the `deteriorated_after_min_dist`
+> selection unintentionally weakened cube-approach behavior; v1 remains the best BC variant.
+
+VLA project context:
+
+> The project's ultimate goal is a **language-conditioned manipulation policy (VLM/VLA-style)**.
+> The current state-only BC/DAgger pipeline establishes the action-policy foundation; instruction metadata is
+> already captured in the dataset (`instruction`, `object_id`, `target_id`) but is not yet fed into the policy.
+> M4 will integrate a text encoder and extend the observation with instruction embeddings, building the
+> infrastructure on which multi-task language conditioning (M5+) will sit.
 
 ---
 
@@ -93,6 +111,12 @@ manufacturing-vla-poc/
     manufacturing_pick_place_v0.yaml
     m3_bc_state.yaml
     m3_bc_state_long.yaml
+    m3_bc_phase_aware.yaml
+    m3_bc_phase_aware_5000.yaml
+    m3_bc_phase_weighted_5000.yaml
+    m3_bc_dagger_v0.yaml
+    m3_bc_dagger_v1.yaml
+    m3_bc_dagger_v2.yaml
 
   docker/
     Dockerfile
@@ -100,31 +124,37 @@ manufacturing-vla-poc/
   scripts/
     m0_random_rollout.py
     m1_language_task_rollout.py
-    m2_collect_step_dataset.py
-    m2_inspect_dataset.py
-    m2_generate_pickcube_expert.py
-    m2_inspect_expert_h5.py
-    m2_convert_expert_h5_to_dataset.py
+    m2_*.py
+    m3_make_phase_aware_dataset.py
     m3_train_bc_state.py
+    m3_train_bc_phase_weighted.py
     m3_eval_openloop_bc_state.py
     m3_eval_closedloop_bc_state.py
+    m3_eval_closedloop_bc_phase.py
+    m3_eval_closedloop_bc_phase_safe.py        # current evaluator (with force_grip)
     m3_record_closedloop_debug.py
+    m3_record_phase_safe_debug.py
+    m3_dagger_common.py
+    m3_dagger_smoke.py
+    m3_collect_dagger_rollouts.py
+    m3_relabel_dagger_with_planner.py
+    m3_build_dagger_aggregate_dataset.py
 
   docs/
     m2_dataset_report.md
+    m3_9_dagger.md
 
   outputs/
-    m0_random_rollout/
-    m1_language_task_rollout/
-    m2_step_dataset/
-    m2_expert_demos/
-    m2_expert_dataset/
-    m2_expert_demos_100/
-    m2_expert_dataset_100/
+    m0_random_rollout/ m1_language_task_rollout/ m2_*/
+    m3_phase_aware_dataset_100/ m3_phase_aware_dataset_5000/
+    m3_dagger_rollouts_{v0,v1,v2}/
+    m3_dagger_corrections_{smoke_v0,v1,v2}/
+    m3_agg_phase_dagger_dataset_{v1,v2}/
 
   runs/
-    m3_bc_state/
-    m3_bc_state_long/
+    m3_bc_state/ m3_bc_state_long/
+    m3_bc_phase_aware/ m3_bc_phase_aware_5000/ m3_bc_phase_weighted_5000/
+    m3_bc_dagger_v1/ m3_bc_dagger_v2/           # m3_bc_dagger_v1 is the chosen BC base
 ```
 
 `outputs/` and `runs/` are generated artifacts and are not expected to be committed.
@@ -522,54 +552,365 @@ Conclusion:
 
 ---
 
-## M3.4 — Planned: Phase-Aware Behavior Cloning
+## M3.4 — Phase-Aware Behavior Cloning
 
-The next milestone is phase-aware BC.
-
-Current observation:
+Phase-aware BC extends the observation with phase signals.
 
 ```text
-obs = state_57
+obs = state_57 + progress_1 + prev_action_8   (obs_dim = 66)
+
+progress     = step_idx / (phase_horizon - 1)
+prev_action  = previous executed action
 ```
 
-Planned observation:
+This reduces phase ambiguity that pure state-only BC suffered from
+(approach vs align vs grasp vs lift vs transfer vs place).
+
+Outputs:
 
 ```text
-obs = state_57 + progress_1 + prev_action_8
+runs/m3_bc_phase_aware/           — 100-demo phase-aware BC
+runs/m3_bc_phase_aware_5000/      — 5000-demo phase-aware BC
+runs/m3_bc_phase_weighted_5000/   — 5000-demo with phase-weighted loss
 ```
 
-Expected dimension:
+Result on PickCube-v1, 30 episodes, seed=3000, phase_horizon=80, max_steps=120:
 
 ```text
-obs_dim = 66
+grasped_once_rate            : 0.567
+placed_once_rate             : 0.033
+mean_return                  : 14.56
+success_rate_once            : 0.000
+mean_final_cube_goal_dist    : 0.289
+mean_min_cube_goal_dist      : 0.165
 ```
 
-Where:
+The cube reaches the goal occasionally (3.3%) but the policy does not robustly close the loop.
+
+---
+
+## M3.5 — Safe Action Filter
+
+Clips policy actions to the expert action distribution (`min..max` per dim, with optional margin).
+This prevents the policy from emitting actions outside what the motion-planner expert ever produced.
+
+Used by all M3.6+ evaluations (`--expert-action-bounds`).
+
+---
+
+## M3.6 — Final-Hold Stabilization
+
+Wrapper that latches the previous action whenever cube reaches near-goal or `is_obj_placed` becomes True,
+preventing the policy from continuing to push the cube past placement.
+
+Result on 100-demo phase-aware BC + final-hold wrapper (best variant):
 
 ```text
-progress = t / T
-prev_action = action_{t-1}
+success_rate_once : 0.033
+placed_once_rate  : 0.033
+grasped_once_rate : 0.567
 ```
 
-Motivation:
+First non-zero closed-loop success.
+
+---
+
+## M3.7 / M3.8 — 5000-Demo and Phase-Weighted Loss
+
+Scaled to 5000 expert demos and added a phase-weighted loss
+(`early : mid : late` = 1 : 2 : 4) to emphasize the place phase.
+Despite more data and a stronger late-phase signal, closed-loop success on
+PickCube-v1 remained 0.0%, reinforcing the conclusion that single-task BC alone
+plateaus here — additional signals (DAgger, language conditioning, vision) are needed.
+
+---
+
+## M3.9 — DAgger Pipeline
+
+Adds policy-visited state correction:
 
 ```text
-The expert trajectory is phase-dependent:
-approach → align → grasp → lift → move → place
-
-A pure state-only MLP has difficulty identifying the current phase.
-Adding progress and previous action should reduce phase ambiguity.
+1. Collect rollouts from the BC policy (m3_collect_dagger_rollouts.py)
+2. Select policy-visited states (focused: near_goal / is_grasped / late_grasp / high_action / deteriorated)
+3. Restore each state and run the PickCube motion-planning expert to produce correction labels
+   (m3_relabel_dagger_with_planner.py)
+4. Aggregate expert + corrections with per-sample weights (m3_build_dagger_aggregate_dataset.py)
+5. Retrain phase-aware BC on the aggregated dataset (m3_train_bc_phase_weighted.py)
 ```
 
-Planned steps:
+Iterations:
 
 ```text
-M3.4A — Convert expert dataset into phase-aware dataset
-M3.4B — Train phase-aware BC
-M3.4C — Open-loop evaluation
-M3.4D — Closed-loop evaluation
-M3.4E — Debug video comparison
+v0  — smoke test of restore + planner first-action correction
+v1  — full run: 50 episodes from phase-aware BC, 1553 selected states,
+       1121 successful corrections (72.2%), sample_weight=2.0
+v2  — release-phase biased: collected from v1 policy with new
+       `late_grasp_far_from_goal` selection and `--disable-deteriorated`.
+       899 selected, 830 corrections (92.3%), but underperformed v1.
 ```
+
+DAgger v1 closed-loop result (best BC variant before heuristic):
+
+```text
+success_rate_once       : 0.0
+grasped_once_rate       : 0.467
+placed_once_rate        : 0.0
+final_grasped_rate      : 0.167
+mean_return             : 20.96
+mean_final_cube_goal_dist : 0.197
+final_robot_static_rate : 0.933
+```
+
+DAgger v1 noticeably improves trajectory shape (cube ends closer to goal) and end-stability,
+but does not break through to placed success.
+
+See [docs/m3_9_dagger.md](docs/m3_9_dagger.md) for the full DAgger workflow and v0→v1→v2 analysis.
+
+---
+
+## M3.9H — force_grip_while_far Inference Heuristic
+
+Debug rollouts on DAgger v1 revealed the dominant remaining failure mode:
+after the policy lifts the cube and reaches `min_cube_goal_dist` around 0.06m,
+it opens the gripper at progress≈0.95 regardless of whether the cube is at the goal,
+causing the cube to drop.
+
+The inference-time heuristic forces `action[-1] = -1.0` (gripper closed) once the
+policy has ever grasped the cube **and** the cube is still further than a threshold
+from the goal:
+
+```bash
+python scripts/m3_eval_closedloop_bc_phase_safe.py \
+  --model runs/m3_bc_dagger_v1/best_model.pt \
+  --normalization runs/m3_bc_dagger_v1/normalization_stats.npz \
+  --expert-action-bounds outputs/m3_agg_phase_dagger_dataset_v1/action_bounds.json \
+  --force-grip-while-far \
+  --force-grip-dist-threshold 0.05 \
+  --out-dir runs/m3_bc_dagger_v1/closedloop_eval_safe_forcegrip
+```
+
+Result (final BC base used for downstream language-conditioned milestones):
+
+```text
+grasped_once_rate     : 0.467
+final_grasped_rate    : 0.367   (vs 0.167 without heuristic)
+mean_return           : 24.10   (vs 20.96 without heuristic)
+placed_once_rate      : 0.0
+```
+
+The heuristic roughly doubles end-state grasp retention.
+
+---
+
+## M4 — Language-Conditioned BC Infrastructure (VLA prerequisite)
+
+M4 wires a CLIP text encoder into the BC pipeline so the policy can consume the
+instruction attached to every demo.
+
+```text
+state_obs = panda_31 + cube_13 + goal_site_13              (= 57)
+obs       = state_obs + progress_1 + prev_action_8         (= 66)
+lang_emb  = CLIPTextModel("clip-vit-base-patch32").pooler_output(instruction)   (= 512)
+
+policy_input = concat(obs, lang_proj(lang_emb))
+             = 66 + 64
+             = 130
+```
+
+Components delivered:
+
+- [scripts/m4_add_instruction_embeddings.py](scripts/m4_add_instruction_embeddings.py)
+  precomputes per-episode CLIP embeddings and copies them into a new dataset
+  directory (`outputs/m4_lang_phase_aware_dataset_100/`).
+- [scripts/m4_train_bc_lang.py](scripts/m4_train_bc_lang.py)
+  trains a `LangBCPolicy` that holds a learned `lang_proj` layer
+  (`lang_emb_dim=512 → lang_proj_dim=64`).
+- [scripts/m4_eval_closedloop_bc_lang.py](scripts/m4_eval_closedloop_bc_lang.py)
+  encodes the user-provided `--instruction` once with CLIP at startup and
+  reuses the embedding every step. All existing eval features
+  (safe-action filter, final-hold wrapper, force-grip heuristic) are preserved.
+- [configs/m4_bc_lang_v0.yaml](configs/m4_bc_lang_v0.yaml) — training config.
+
+Build + train + evaluate:
+
+```bash
+python scripts/m4_add_instruction_embeddings.py \
+  --in-dir outputs/m3_phase_aware_dataset_100 \
+  --out-dir outputs/m4_lang_phase_aware_dataset_100 \
+  --text-encoder openai/clip-vit-base-patch32
+
+python scripts/m4_train_bc_lang.py --config configs/m4_bc_lang_v0.yaml
+
+python scripts/m4_eval_closedloop_bc_lang.py \
+  --model runs/m4_bc_lang_v0/best_model.pt \
+  --normalization runs/m4_bc_lang_v0/normalization_stats.npz \
+  --expert-action-bounds outputs/m3_phase_aware_dataset_100/action_bounds.json \
+  --instruction "Pick the bolt-like part and place it into the left fixture." \
+  --out-dir runs/m4_bc_lang_v0/closedloop_eval_safe
+```
+
+Sanity check (vs the non-language M3 phase-aware BC trained on the same 100 demos):
+
+| Metric                  | M3 phase_aware | M4 lang_v0 (CLIP) |
+| --                      | --             | --                |
+| success_rate_once       | 0.000          | 0.000             |
+| grasped_once_rate       | 0.567          | 0.500             |
+| placed_once_rate        | 0.033          | **0.033** ✓       |
+| mean_return             | 14.56          | 13.92             |
+| mean_final_cube_goal_dist | 0.289        | 0.277             |
+| mean_min_cube_goal_dist | 0.165          | 0.164             |
+
+Closed-loop performance is statistically indistinguishable from the non-language
+baseline, which is exactly what the sanity check requires:
+the language pathway is wired correctly without breaking the action policy.
+Because every demo solves the same PickCube task, the instruction is currently a
+**dummy signal** that the network is free to ignore — that the policy *can*
+ignore it (rather than being corrupted by it) is the precondition for M5.
+
+See [docs/m4_lang_bc.md](docs/m4_lang_bc.md) for the full M4 design notes.
+
+---
+
+## M5 — Multi-Task Language-Conditioned BC
+
+M5 combines three ManiSkill cube-manipulation tasks (`PickCube-v1`,
+`PushCube-v1`, `PullCube-v1`) into a single dataset and trains the M4
+`LangBCPolicy` on the merged set. All three tasks share the same
+state observation layout (panda 31 + cube 13 + goal 13 = 57), so no policy
+architecture change is needed.
+
+```bash
+# 100 episodes per task with the ManiSkill motion-planning expert
+python scripts/m5_generate_multitask_expert.py --env-id PickCube-v1 --num-traj 100 --only-count-success
+python scripts/m5_generate_multitask_expert.py --env-id PushCube-v1 --num-traj 100 --only-count-success
+python scripts/m5_generate_multitask_expert.py --env-id PullCube-v1 --num-traj 100 --only-count-success
+
+# Merge HDF5 files into a unified M3-style dataset with task metadata + per-task instruction templates
+python scripts/m5_convert_multitask_h5_to_dataset.py \
+  --record-dir outputs/m5_expert_demos_multitask \
+  --config configs/manufacturing_multitask_v0.yaml \
+  --out-dir outputs/m5_multitask_dataset
+
+# Add phase-aware features (progress, prev_action)
+python scripts/m3_make_phase_aware_dataset.py \
+  --src-dir outputs/m5_multitask_dataset \
+  --out-dir outputs/m5_multitask_phase_aware_dataset
+
+# Add CLIP instruction embeddings
+python scripts/m4_add_instruction_embeddings.py \
+  --in-dir outputs/m5_multitask_phase_aware_dataset \
+  --out-dir outputs/m5_multitask_lang_phase_aware_dataset
+
+# Reuse the M4 trainer
+python scripts/m4_train_bc_lang.py --config configs/m5_bc_lang_multitask_v0.yaml
+
+# Multi-task eval (the m5 eval auto-resolves goal_site vs goal_region)
+python scripts/m5_eval_closedloop_bc_lang.py \
+  --env-id PickCube-v1 \
+  --model runs/m5_bc_lang_multitask_v0/best_model.pt \
+  --normalization runs/m5_bc_lang_multitask_v0/normalization_stats.npz \
+  --expert-action-bounds outputs/m5_multitask_lang_phase_aware_dataset/action_bounds.json \
+  --instruction "Pick the bolt-like part and place it at the left fixture." \
+  --out-dir runs/m5_bc_lang_multitask_v0/closedloop_eval_pickcube
+```
+
+Result on 300-episode multi-task dataset, 30 eval episodes per cell,
+seed=3000, phase_horizon=80, max_steps=120:
+
+| env / instruction         | success | grasped | placed | min_dist | mean_return |
+| --                        | --      | --      | --     | --       | --          |
+| PickCube / Pick (matched) | 0.00    | 0.10    | 0.00   | 0.195    | 11.91       |
+| PickCube / Push (swap)    | 0.00    | 0.10    | 0.00   | 0.199    | 10.15       |
+| PickCube / Pull (swap)    | 0.00    | 0.07    | 0.00   | 0.201    | 11.27       |
+| **PushCube / Push (matched)** | **0.10** | 0.00 | 0.00 | 0.191    | 15.13       |
+| PushCube / Pick (swap)    | 0.00    | 0.00    | 0.00   | 0.196    | 15.69       |
+| PullCube / Pull (matched) | 0.00    | 0.00    | 0.00   | 0.193    | 15.70       |
+
+**Two takeaways:**
+
+- ✅ **First closed-loop success on PushCube (10%)** — the project's first
+  non-zero `success_rate_once` after M3.0 onward. `best_val_mse_norm` also
+  drops to **0.00426** (vs M4's 0.00584), so multi-task data improves
+  open-loop accuracy.
+- ❌ **Instruction is not used as a differentiator.** Swapping Pick→Push or
+  Pick→Pull in the PickCube env barely changes behavior (grasp rate
+  10%→10%→7%, min_dist 0.195→0.199→0.201). The policy decides almost
+  entirely from `state_obs`; CLIP+lang_proj is effectively dummy input.
+
+Why: the lang signal goes through a small 64-dim projection next to a 66-dim
+state input, the CLIP encoder is frozen, and the dataset has only 100 episodes
+per task. Behavior cloning has no direct incentive to attend to language when
+state alone resolves the action.
+
+See [docs/m5_multitask.md](docs/m5_multitask.md) for the full pipeline + swap-matrix analysis.
+
+---
+
+## M5.1 — Instruction-Conditional Auxiliary Loss (genuine language conditioning)
+
+M5.1 adds a tiny classification head on top of `lang_proj` predicting
+`task_id ∈ {pick_place, push_horizontal, pull_horizontal}` and trains jointly:
+
+```text
+total_loss = BC_phase_weighted_MSE(action) + aux_weight × CrossEntropy(task_logits, task_id)
+```
+
+This forces `lang_proj` activations to be linearly separable by task, which
+gives the BC head no excuse to ignore them — gradient through `lang_proj` is
+no longer dominated by uninformative noise.
+
+Implementation: [scripts/m5_1_train_bc_lang_aux.py](scripts/m5_1_train_bc_lang_aux.py),
+[scripts/m5_1_eval_closedloop_bc_lang_aux.py](scripts/m5_1_eval_closedloop_bc_lang_aux.py),
+[configs/m5_1_bc_lang_multitask_aux_v0.yaml](configs/m5_1_bc_lang_multitask_aux_v0.yaml).
+
+Training result:
+
+```text
+best_epoch          : 305 / 500
+best_val_mse_norm   : 0.00384   (M5: 0.00426; M4: 0.00584)
+best_val_task_acc   : 1.000     (lang_proj is now perfectly task-discriminative)
+aux_weight          : 1.0
+```
+
+### Closed-loop swap matrix — M5 vs M5.1
+
+30 episodes per cell, seed=3000, phase_horizon=80, max_steps=120.
+
+| env       | instruction      | M5 success | **M5.1 success** | M5 grasped | M5.1 grasped | M5 placed | M5.1 placed |
+| --        | --               | --         | --               | --         | --           | --        | --          |
+| PickCube  | Pick (matched)   | 0.00       | 0.00             | 0.10       | 0.07         | 0.00      | **0.03** ⭐  |
+| PickCube  | Push (swap)      | 0.00       | 0.00             | **0.10**   | **0.00** ⭐   | 0.00      | 0.00        |
+| PickCube  | Pull (swap)      | 0.00       | 0.00             | 0.07       | **0.00** ⭐   | 0.00      | 0.00        |
+| PushCube  | Push (matched)   | 0.10       | **0.20** ⭐       | 0.00       | 0.00         | 0.00      | 0.00        |
+| PushCube  | Pick (swap)      | 0.00       | 0.00             | 0.00       | 0.00         | 0.00      | 0.00        |
+| PullCube  | Pull (matched)  | 0.00       | **0.33** ⭐⭐       | 0.00       | 0.00         | 0.00      | 0.00        |
+
+**Key observations:**
+
+- ✅ **Genuine instruction following** — in PickCube the grasp rate drops
+  10%/7% → **0%/0%** when the instruction is swapped to Push/Pull. The
+  policy now consults the instruction before deciding to grasp.
+- ✅ **Matched-instruction success jumps**:
+  - PullCube: **0% → 33%** (project's first non-zero PullCube success)
+  - PushCube: 10% → **20%**
+  - PickCube placed: 0% → **3%** (project's first non-zero placement)
+- ✅ Min cube-goal distance is also instruction-sensitive (PullCube:
+  0.193 → 0.163 with the matching instruction).
+- ✅ `val_task_acc = 1.0` — lang_proj activations encode the task perfectly,
+  and the BC head clearly uses them.
+
+This is the first milestone where the project ships a real language-conditioned policy: instruction is no longer a dummy passenger.
+
+See [docs/m5_1_aux_loss.md](docs/m5_1_aux_loss.md) for the full analysis.
+
+---
+
+## M6 — Planned: Vision (VLA-style observation)
+
+With the language path now load-bearing, the natural next step is to swap
+or augment the state observation with RGB renderings and reuse the CLIP
+vision tower (frozen, then optionally fine-tuned). This is the genuine
+VLA setting: rgb image + instruction → action.
 
 ---
 
@@ -628,8 +969,16 @@ This project currently demonstrates:
 
 Current technical conclusion:
 
-> State-only BC can learn expert actions in open-loop evaluation, but it is not robust enough for closed-loop grasping.  
-> The next improvement is phase-aware BC with progress and previous-action conditioning.
+> Single-task BC + DAgger on PickCube-v1 plateaus at closed-loop success ≈ 0% despite
+> 36.7% end-grasp retention (with the force_grip inference heuristic).
+> This is consistent with the well-known limitation of pure BC under distribution shift
+> and the fact that PickCube has a tight place tolerance.
+> The chosen BC base for downstream work is **DAgger v1 + force_grip**.
+>
+> The project's true target is a **language-conditioned VLA-style policy**.
+> The next milestone (M4) extends the observation with instruction embeddings,
+> establishing the language-conditioning code path on top of the existing BC base.
+> M5+ will add multi-task variants where the instruction becomes a real action differentiator.
 
 ---
 

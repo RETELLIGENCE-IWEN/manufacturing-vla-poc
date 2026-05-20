@@ -11,33 +11,56 @@ import mani_skill.envs  # noqa: F401
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from transformers import CLIPTextModel, CLIPTokenizer
 
 
-class BCPolicy(nn.Module):
+class LangBCPolicy(nn.Module):
     def __init__(
         self,
         obs_dim: int,
+        lang_emb_dim: int,
+        lang_proj_dim: int,
         action_dim: int,
         hidden_dims: list[int],
         dropout: float,
     ) -> None:
         super().__init__()
+        self.obs_dim = obs_dim
+        self.lang_emb_dim = lang_emb_dim
+        self.lang_proj_dim = lang_proj_dim
+
+        self.lang_proj = nn.Linear(lang_emb_dim, lang_proj_dim)
 
         layers: list[nn.Module] = []
-        in_dim = obs_dim
-
+        in_dim = obs_dim + lang_proj_dim
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.ReLU())
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
             in_dim = hidden_dim
-
         layers.append(nn.Linear(in_dim, action_dim))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
+    def forward(self, obs: torch.Tensor, lang_emb: torch.Tensor) -> torch.Tensor:
+        lang_p = F.relu(self.lang_proj(lang_emb))
+        x = torch.cat([obs, lang_p], dim=-1)
+        return self.net(x)
+
+
+def encode_instruction(
+    text: str,
+    text_encoder_name: str,
+    device: torch.device,
+) -> np.ndarray:
+    tokenizer = CLIPTokenizer.from_pretrained(text_encoder_name)
+    model = CLIPTextModel.from_pretrained(text_encoder_name).to(device)
+    model.eval()
+    with torch.no_grad():
+        tokens = tokenizer([text], padding=True, truncation=True, return_tensors="pt").to(device)
+        out = model(**tokens)
+    return out.pooler_output[0].cpu().numpy().astype(np.float32)
 
 
 def set_seed(seed: int) -> None:
@@ -217,11 +240,13 @@ def load_policy(
     model_path: Path,
     norm_path: Path,
     device: torch.device,
-) -> tuple[BCPolicy, dict[str, np.ndarray]]:
+) -> tuple[LangBCPolicy, dict[str, np.ndarray]]:
     checkpoint = torch.load(model_path, map_location=device)
 
-    model = BCPolicy(
+    model = LangBCPolicy(
         obs_dim=int(checkpoint["obs_dim"]),
+        lang_emb_dim=int(checkpoint["lang_emb_dim"]),
+        lang_proj_dim=int(checkpoint["lang_proj_dim"]),
         action_dim=int(checkpoint["action_dim"]),
         hidden_dims=[int(x) for x in checkpoint["hidden_dims"]],
         dropout=float(checkpoint["dropout"]),
@@ -243,15 +268,17 @@ def load_policy(
 
 @torch.no_grad()
 def predict_action(
-    model: BCPolicy,
+    model: LangBCPolicy,
     stats: dict[str, np.ndarray],
     obs_raw: np.ndarray,
+    lang_emb: np.ndarray,
     device: torch.device,
 ) -> np.ndarray:
     obs_norm = ((obs_raw - stats["obs_mean"]) / stats["obs_std"]).astype(np.float32)
 
     obs_t = torch.from_numpy(obs_norm[None, :]).to(device)
-    pred_norm = model(obs_t).cpu().numpy()[0].astype(np.float32)
+    lang_t = torch.from_numpy(lang_emb[None, :]).to(device)
+    pred_norm = model(obs_t, lang_t).cpu().numpy()[0].astype(np.float32)
 
     action = pred_norm * stats["action_std"] + stats["action_mean"]
     return action.astype(np.float32)
@@ -347,9 +374,10 @@ def run_episode(
     seed: int,
     max_steps: int,
     phase_horizon: int,
-    model: BCPolicy | None,
+    model: LangBCPolicy | None,
     stats: dict[str, np.ndarray] | None,
     device: torch.device,
+    lang_emb: np.ndarray | None = None,
     expert_low: np.ndarray | None = None,
     expert_high: np.ndarray | None = None,
     hard_threshold_gripper: bool = False,
@@ -398,10 +426,14 @@ def run_episode(
                 prev_action=prev_action,
             )
 
+            if lang_emb is None:
+                raise RuntimeError("phase_bc with LangBCPolicy requires a precomputed lang_emb.")
+
             action = predict_action(
                 model=model,
                 stats=stats,
                 obs_raw=obs,
+                lang_emb=lang_emb,
                 device=device,
             )
 
@@ -541,9 +573,10 @@ def evaluate_policy(
     phase_horizon: int,
     env_id: str,
     sim_backend: str,
-    model: BCPolicy | None,
+    model: LangBCPolicy | None,
     stats: dict[str, np.ndarray] | None,
     device: torch.device,
+    lang_emb: np.ndarray | None = None,
     expert_low: np.ndarray | None = None,
     expert_high: np.ndarray | None = None,
     hard_threshold_gripper: bool = False,
@@ -578,6 +611,7 @@ def evaluate_policy(
             model=model,
             stats=stats,
             device=device,
+            lang_emb=lang_emb,
             expert_low=expert_low,
             expert_high=expert_high,
             hard_threshold_gripper=hard_threshold_gripper,
@@ -672,6 +706,18 @@ def main() -> None:
     )
     parser.add_argument("--force-grip-dist-threshold", type=float, default=0.05)
 
+    parser.add_argument(
+        "--instruction",
+        type=str,
+        default="Pick the bolt-like part and place it into the left fixture.",
+        help="Natural-language instruction. Encoded once with CLIP at start and reused every step.",
+    )
+    parser.add_argument(
+        "--text-encoder",
+        type=str,
+        default="openai/clip-vit-base-patch32",
+    )
+
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -701,6 +747,13 @@ def main() -> None:
     expert_low, expert_high = load_expert_action_bounds(
         bounds_path,
         margin=args.expert_bound_margin,
+    )
+
+    print(f"[m4-eval] encoding instruction with {args.text_encoder}: {args.instruction!r}")
+    lang_emb = encode_instruction(
+        text=args.instruction,
+        text_encoder_name=args.text_encoder,
+        device=device,
     )
 
     random_summary = evaluate_policy(
@@ -733,6 +786,7 @@ def main() -> None:
         model=model,
         stats=stats,
         device=device,
+        lang_emb=lang_emb,
         expert_low=expert_low,
         expert_high=expert_high,
         hard_threshold_gripper=args.hard_threshold_gripper,
@@ -744,11 +798,14 @@ def main() -> None:
     )
 
     summary = {
-        "milestone": "M3.6A",
+        "milestone": "M4C",
         "description": (
-            "Expert-bounded phase-aware BC closed-loop evaluation with fixed horizon, "
-            "success-condition decomposition, and optional final hold stabilization."
+            "Language-conditioned phase-aware BC closed-loop evaluation. "
+            "Instruction is encoded once with CLIP and broadcast to all steps."
         ),
+        "instruction": args.instruction,
+        "text_encoder": args.text_encoder,
+        "lang_emb_dim": int(lang_emb.shape[0]),
         "env_id": args.env_id,
         "control_mode": "pd_joint_pos",
         "obs_mode": "none",

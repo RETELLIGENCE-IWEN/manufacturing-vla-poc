@@ -20,6 +20,7 @@ RUN python -m pip install --upgrade pip && \
       rich \
       imageio \
       imageio-ffmpeg \
-      h5py
+      h5py \
+      transformers==4.46.3
 
 CMD ["/bin/bash"]

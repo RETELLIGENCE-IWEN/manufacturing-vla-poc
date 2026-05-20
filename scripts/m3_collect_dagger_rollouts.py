@@ -38,6 +38,7 @@ def selection_reasons(
     placed_once_failed_late: bool,
     deteriorated_after_min_dist: bool,
     high_action_norm: bool,
+    late_grasp_far_from_goal: bool,
     args: argparse.Namespace,
 ) -> list[str]:
     reasons: list[str] = []
@@ -48,6 +49,8 @@ def selection_reasons(
         reasons.append("near_goal")
     if is_grasped:
         reasons.append("is_grasped")
+    if late_grasp_far_from_goal:
+        reasons.append("late_grasp_far_from_goal")
     if placed_once_failed_late:
         reasons.append("placed_once_failed_late")
     if deteriorated_after_min_dist:
@@ -72,6 +75,12 @@ def build_selected_mask(
 ) -> tuple[np.ndarray, list[list[str]]]:
     T = int(progress.shape[0])
 
+    late_grasp_mask = (
+        (progress.reshape(-1) >= args.late_grasp_min_progress)
+        & is_grasped.reshape(-1).astype(np.bool_)
+        & (cube_goal_dist.reshape(-1) > args.late_grasp_min_dist)
+    )
+
     if args.selection_mode == "all":
         selected = np.ones((T,), dtype=np.bool_)
     else:
@@ -80,12 +89,13 @@ def build_selected_mask(
             selected |= progress.reshape(-1) >= args.min_progress
         selected |= cube_goal_dist.reshape(-1) <= args.near_goal_dist
         selected |= is_grasped.reshape(-1).astype(np.bool_)
+        selected |= late_grasp_mask
 
         if T > 0 and not bool(success[-1]) and bool(np.any(is_obj_placed)):
             first_place = int(np.flatnonzero(is_obj_placed.astype(np.bool_))[0])
             selected[first_place:] = True
 
-        if T > 0 and not bool(success[-1]):
+        if (not args.disable_deteriorated) and T > 0 and not bool(success[-1]):
             min_idx = int(np.argmin(cube_goal_dist))
             min_dist = float(cube_goal_dist[min_idx])
             deteriorated = (
@@ -128,7 +138,8 @@ def build_selected_mask(
             and first_place <= t
         )
         deteriorated_after_min_dist = bool(
-            not bool(success[-1])
+            (not args.disable_deteriorated)
+            and not bool(success[-1])
             and t >= min_idx
             and float(cube_goal_dist[t]) >= min_dist + args.deterioration_margin
         )
@@ -142,6 +153,7 @@ def build_selected_mask(
                 placed_once_failed_late=placed_once_failed_late,
                 deteriorated_after_min_dist=deteriorated_after_min_dist,
                 high_action_norm=high_action_norm,
+                late_grasp_far_from_goal=bool(late_grasp_mask[t]),
                 args=args,
             )
         )
@@ -400,6 +412,23 @@ def main() -> None:
     )
     parser.add_argument("--near-goal-dist", type=float, default=0.12)
     parser.add_argument("--deterioration-margin", type=float, default=0.03)
+    parser.add_argument(
+        "--disable-deteriorated",
+        action="store_true",
+        help="Disable the 'deteriorated_after_min_dist' selection (dominates v0/v1 and is mostly retreat/cleanup states).",
+    )
+    parser.add_argument(
+        "--late-grasp-min-progress",
+        type=float,
+        default=0.6,
+        help="When is_grasped at progress>=this and cube still far from goal, flag for transfer-continuation correction.",
+    )
+    parser.add_argument(
+        "--late-grasp-min-dist",
+        type=float,
+        default=0.05,
+        help="Cube-goal distance threshold above which a late grasp counts as 'still need to transfer'.",
+    )
     parser.add_argument("--high-action-norm-quantile", type=float, default=0.95)
     parser.add_argument("--max-selected-per-episode", type=int, default=40)
     parser.add_argument("--enable-final-hold", action="store_true")
@@ -526,6 +555,9 @@ def main() -> None:
             "use_progress_as_selection": args.use_progress_as_selection,
             "near_goal_dist": args.near_goal_dist,
             "deterioration_margin": args.deterioration_margin,
+            "disable_deteriorated": args.disable_deteriorated,
+            "late_grasp_min_progress": args.late_grasp_min_progress,
+            "late_grasp_min_dist": args.late_grasp_min_dist,
             "high_action_norm_quantile": args.high_action_norm_quantile,
             "max_selected_per_episode": args.max_selected_per_episode,
         },

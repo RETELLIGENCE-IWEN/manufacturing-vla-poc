@@ -1,0 +1,70 @@
+task_family: manufacturing_multitask_v0
+
+description: >
+  Manufacturing-style multi-task language-conditioned wrapper over three
+  ManiSkill Panda-arm cube-manipulation tasks (PickCube, PushCube, PullCube).
+  Each base task gets its own instruction templates so the language signal
+  carries the action pattern (pick-and-place vs push vs pull).
+
+tasks:
+  - id: pick_place
+    env_id: PickCube-v1
+    verb: pick
+    instruction_templates:
+      - "Pick the {object_name} and place it at the {target_name}."
+      - "Grasp the {object_name} and put it onto the {target_name}."
+      - "Lift the {object_name} and move it to the {target_name}."
+      - "Pick up the {object_name} and deliver it to the {target_name}."
+    object_names:
+      - red component
+      - blue component
+      - bolt-like part
+    target_names:
+      - left fixture
+      - right fixture
+      - inspection tray
+      - drop zone
+
+  - id: push_horizontal
+    env_id: PushCube-v1
+    verb: push
+    instruction_templates:
+      - "Push the {object_name} across the table to the {target_name}."
+      - "Slide the {object_name} forward into the {target_name}."
+      - "Press the {object_name} along the workspace toward the {target_name}."
+      - "Shove the {object_name} to reach the {target_name}."
+    object_names:
+      - red component
+      - blue component
+      - bolt-like part
+    target_names:
+      - forward goal area
+      - far drop zone
+      - assembly target
+      - inspection zone
+
+  - id: pull_horizontal
+    env_id: PullCube-v1
+    verb: pull
+    instruction_templates:
+      - "Pull the {object_name} back toward the {target_name}."
+      - "Drag the {object_name} closer to the {target_name}."
+      - "Hook the {object_name} and bring it to the {target_name}."
+      - "Retrieve the {object_name} into the {target_name}."
+    object_names:
+      - red component
+      - blue component
+      - bolt-like part
+    target_names:
+      - near return zone
+      - operator-side fixture
+      - rework tray
+      - close drop zone
+
+notes:
+  - M5 unifies three ManiSkill tasks behind a single phase-aware language-conditioned policy.
+  - State observation layout is identical across tasks (panda 31 + cube 13 + goal 13 = 57),
+    enabling shared training without per-task adapters.
+  - PickCube uses actor name "goal_site"; PushCube/PullCube use "goal_region".
+    The converter normalizes by extracting the first non-table actor with a 13-dim state
+    that is not the cube.

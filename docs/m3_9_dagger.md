@@ -120,3 +120,64 @@ python scripts/m3_eval_closedloop_bc_phase_safe.py \
   --phase-horizon 80 \
   --out-dir runs/m3_bc_dagger_v0/closedloop_eval_safe
 ```
+
+---
+
+## 7. v0 → v1 → v2 Experiment Summary
+
+DAgger was iterated twice on top of the phase-aware BC policy.
+
+### Closed-loop comparison (PickCube-v1, 30 episodes, seed=3000, phase_horizon=80, max_steps=120)
+
+| Policy                          | grasped_once | final_grasped | placed_once | mean_return | mean_final_dist | mean_min_dist |
+| --                              | --           | --            | --          | --          | --              | --            |
+| phase_aware BC (baseline)       | 0.567        | 0.000         | 0.033       | 14.56       | 0.289           | 0.165         |
+| DAgger v1                       | 0.467        | 0.167         | 0.000       | 20.96       | 0.197           | 0.182         |
+| DAgger v1 + force_grip          | **0.467**    | **0.367**     | 0.000       | **24.10**   | 0.206           | 0.190         |
+| DAgger v2 (release-bias)        | 0.333        | 0.000         | 0.000       | 16.08       | 0.208           | 0.197         |
+| DAgger v2 + force_grip          | 0.300        | 0.167         | 0.000       | 18.57       | 0.209           | 0.193         |
+
+**Chosen BC base: DAgger v1 + force_grip.**
+
+### v1 vs v2 collector configs
+
+```text
+v1 selection: near_goal + is_grasped + placed_once_failed_late + deteriorated_after_min_dist + high_action_norm
+v1 dataset:   1553 selected → 1121 successful corrections (72.2%), 3 correction episodes, sample_weight=2.0
+
+v2 selection: near_goal + is_grasped + late_grasp_far_from_goal + high_action_norm
+              (deteriorated disabled, late_grasp_min_progress=0.6, late_grasp_min_dist=0.05)
+v2 dataset:   899 selected → 830 successful corrections (92.3%), 2 correction episodes, sample_weight=2.0
+```
+
+### Why v2 regressed
+
+Debug trajectories (seed=3021 and seed=3028) showed v2 fails to approach the cube at all
+(grasp_count=0 across the entire episode), whereas v1 grasps and partially transfers
+(seed=3021: min_cube_goal_dist=0.061 with v1 vs 0.230 with v2).
+
+The dominant hypothesis: **`deteriorated_after_min_dist` was unintentionally
+providing an "actively re-approach the cube after losing it" signal**, not just retreat data.
+Removing it caused the policy to drift away from cube-approach behavior. The 240
+`late_grasp_far_from_goal` correction states were not enough to compensate, possibly because
+they were concentrated in 2 correction episodes (vs 3 for v1) which amplified pattern overfitting.
+
+### Why force_grip helps
+
+Step logs on v1 showed the dominant failure mode: at progress≈0.95 the policy opens
+the gripper regardless of cube position, dropping the cube even when far from the goal.
+The `force_grip_while_far` inference heuristic (in
+[scripts/m3_eval_closedloop_bc_phase_safe.py](../scripts/m3_eval_closedloop_bc_phase_safe.py))
+clamps `action[-1] = -1.0` once the policy has ever grasped the cube and the cube is still
+beyond the threshold from the goal. This roughly doubles `final_grasped_rate` (0.167 → 0.367).
+
+Attempts to fix release timing without the heuristic (training-time DAgger v2; inference-time
+phase_horizon adjustments h100/h120) both regressed: phase_horizon changes caused input
+distribution shift that degraded grasp itself.
+
+### Conclusion
+
+Single-task BC + DAgger on PickCube-v1 plateaus at this level. The remaining gap to
+closed-loop success is unlikely to close with more BC iterations; downstream milestones
+should pivot toward language conditioning (M4) and multi-task generalization (M5+),
+which is the project's actual goal.
