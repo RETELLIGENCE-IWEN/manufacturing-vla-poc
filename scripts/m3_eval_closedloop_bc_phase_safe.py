@@ -14,13 +14,7 @@ import torch.nn as nn
 
 
 class BCPolicy(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        hidden_dims: list[int],
-        dropout: float,
-    ) -> None:
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dims: list[int], dropout: float) -> None:
         super().__init__()
 
         layers: list[nn.Module] = []
@@ -62,15 +56,7 @@ def scalar_float(x: Any) -> float:
 
 
 def get_state_dict(env: gym.Env) -> dict[str, Any]:
-    """
-    ManiSkill wrappers/version may expose get_state_dict at different levels.
-    Try common access paths.
-    """
-    candidates = [
-        env,
-        getattr(env, "unwrapped", None),
-        getattr(env, "base_env", None),
-    ]
+    candidates = [env, getattr(env, "unwrapped", None), getattr(env, "base_env", None)]
 
     for candidate in candidates:
         if candidate is None:
@@ -78,10 +64,7 @@ def get_state_dict(env: gym.Env) -> dict[str, Any]:
         if hasattr(candidate, "get_state_dict"):
             return candidate.get_state_dict()
 
-    raise RuntimeError(
-        "Could not find get_state_dict() on env/env.unwrapped/env.base_env. "
-        "Check ManiSkill API version."
-    )
+    raise RuntimeError("Could not find get_state_dict() on env.")
 
 
 def set_env_time_limit(env: gym.Env, max_steps: int) -> None:
@@ -125,45 +108,46 @@ def set_env_time_limit(env: gym.Env, max_steps: int) -> None:
 def squeeze_first_batch(x: Any) -> np.ndarray:
     arr = to_numpy(x).astype(np.float32)
 
-    # ManiSkill often returns batched tensors with shape [1, D].
     if arr.ndim >= 2 and arr.shape[0] == 1:
         arr = arr[0]
 
     return arr.reshape(-1).astype(np.float32)
 
 
-def build_bc_obs_from_env(env: gym.Env) -> np.ndarray:
-    """
-    Build the exact M3 training observation layout:
-
-    panda articulation state: 31 dims
-    cube actor state: 13 dims
-    goal_site actor state: 13 dims
-    total: 57 dims
-    """
+def build_state_obs_from_env(env: gym.Env) -> np.ndarray:
     state = get_state_dict(env)
 
-    try:
-        panda = squeeze_first_batch(state["articulations"]["panda"])
-        cube = squeeze_first_batch(state["actors"]["cube"])
-        goal_site = squeeze_first_batch(state["actors"]["goal_site"])
-    except KeyError as exc:
-        available = {
-            "top_level": list(state.keys()),
-            "actors": list(state.get("actors", {}).keys()) if isinstance(state.get("actors", {}), dict) else None,
-            "articulations": list(state.get("articulations", {}).keys())
-            if isinstance(state.get("articulations", {}), dict)
-            else None,
-        }
-        raise KeyError(f"Missing expected state key: {exc}. Available keys: {available}") from exc
+    panda = squeeze_first_batch(state["articulations"]["panda"])
+    cube = squeeze_first_batch(state["actors"]["cube"])
+    goal_site = squeeze_first_batch(state["actors"]["goal_site"])
 
     obs = np.concatenate([panda, cube, goal_site], axis=0).astype(np.float32)
 
     if obs.shape[0] != 57:
-        raise ValueError(
-            f"Unexpected BC obs dim: {obs.shape[0]}. "
-            f"Expected 57 = panda(31) + cube(13) + goal_site(13)."
-        )
+        raise ValueError(f"Unexpected state obs dim: {obs.shape[0]}, expected 57")
+
+    return obs
+
+
+def build_phase_obs(
+    env: gym.Env,
+    step_idx: int,
+    phase_horizon: int,
+    prev_action: np.ndarray,
+) -> np.ndarray:
+    state_obs = build_state_obs_from_env(env)
+
+    denom = max(1, phase_horizon - 1)
+    progress_value = min(float(step_idx) / float(denom), 1.0)
+    progress = np.asarray([progress_value], dtype=np.float32)
+
+    obs = np.concatenate(
+        [state_obs, progress, prev_action.astype(np.float32).reshape(-1)],
+        axis=0,
+    ).astype(np.float32)
+
+    if obs.shape[0] != 66:
+        raise ValueError(f"Unexpected phase-aware obs dim: {obs.shape[0]}, expected 66")
 
     return obs
 
@@ -197,7 +181,7 @@ def load_policy(
 
 
 @torch.no_grad()
-def predict_bc_action(
+def predict_action(
     model: BCPolicy,
     stats: dict[str, np.ndarray],
     obs_raw: np.ndarray,
@@ -222,50 +206,102 @@ def clip_action(env: gym.Env, action: np.ndarray) -> np.ndarray:
 
     return action.astype(np.float32)
 
+def load_expert_action_bounds(path: Path, margin: float) -> tuple[np.ndarray, np.ndarray]:
+    with path.open("r", encoding="utf-8") as f:
+        bounds = json.load(f)
+
+    low = np.asarray(bounds["min"], dtype=np.float32)
+    high = np.asarray(bounds["max"], dtype=np.float32)
+
+    span = high - low
+    low = low - margin * span
+    high = high + margin * span
+
+    return low.astype(np.float32), high.astype(np.float32)
+
+
+def apply_safe_action_filter(
+    action: np.ndarray,
+    expert_low: np.ndarray,
+    expert_high: np.ndarray,
+    hard_threshold_gripper: bool,
+) -> np.ndarray:
+    action = action.reshape(-1).astype(np.float32)
+
+    # Clip all dimensions to expert distribution range.
+    action = np.clip(action, expert_low, expert_high).astype(np.float32)
+
+    # Treat the last action dimension as gripper-like open/close command.
+    if hard_threshold_gripper:
+        action[-1] = 1.0 if action[-1] >= 0.0 else -1.0
+
+    return action.astype(np.float32)
+
 
 def run_episode(
     env: gym.Env,
     policy_name: str,
     seed: int,
     max_steps: int,
+    phase_horizon: int,
     model: BCPolicy | None,
     stats: dict[str, np.ndarray] | None,
     device: torch.device,
+    expert_low: np.ndarray | None = None,
+    expert_high: np.ndarray | None = None,
+    hard_threshold_gripper: bool = False,
 ) -> dict[str, Any]:
     env.reset(seed=seed)
 
     rewards: list[float] = []
     success_flags: list[bool] = []
-    steps = 0
+    action_norms: list[float] = []
+
+    prev_action = np.zeros((8,), dtype=np.float32)
 
     for t in range(max_steps):
         if policy_name == "random":
             action = env.action_space.sample()
-        elif policy_name == "bc":
+        elif policy_name == "phase_bc":
             if model is None or stats is None:
-                raise RuntimeError("BC policy requested but model/stats are missing.")
-            obs_raw = build_bc_obs_from_env(env)
-            action = predict_bc_action(
+                raise RuntimeError("phase_bc requested but model/stats are missing.")
+
+            obs = build_phase_obs(
+                env=env,
+                step_idx=t,
+                phase_horizon=phase_horizon,
+                prev_action=prev_action,
+            )
+
+            action = predict_action(
                 model=model,
                 stats=stats,
-                obs_raw=obs_raw,
+                obs_raw=obs,
                 device=device,
             )
+            if expert_low is not None and expert_high is not None:
+                action = apply_safe_action_filter(
+                    action=action,
+                    expert_low=expert_low,
+                    expert_high=expert_high,
+                    hard_threshold_gripper=hard_threshold_gripper,
+                )
+
             action = clip_action(env, action)
         else:
-            raise ValueError(f"Unknown policy_name: {policy_name}")
+            raise ValueError(f"Unknown policy: {policy_name}")
 
         _, reward, terminated, truncated, info = env.step(action)
 
-        reward_value = scalar_float(reward)
-        rewards.append(reward_value)
+        prev_action = np.asarray(action, dtype=np.float32).reshape(-1)
+
+        rewards.append(scalar_float(reward))
+        action_norms.append(float(np.linalg.norm(prev_action)))
 
         success = False
         if isinstance(info, dict) and "success" in info:
             success = scalar_bool(info["success"])
-
         success_flags.append(success)
-        steps = t + 1
 
         if scalar_bool(terminated) or scalar_bool(truncated):
             break
@@ -273,10 +309,12 @@ def run_episode(
     return {
         "policy": policy_name,
         "seed": seed,
-        "num_steps": steps,
+        "num_steps": len(rewards),
         "return": float(np.sum(rewards)),
         "success_once": bool(any(success_flags)),
         "final_success": bool(success_flags[-1]) if success_flags else False,
+        "mean_action_norm": float(np.mean(action_norms)) if action_norms else 0.0,
+        "max_action_norm": float(np.max(action_norms)) if action_norms else 0.0,
     }
 
 
@@ -285,11 +323,15 @@ def evaluate_policy(
     num_episodes: int,
     seed_start: int,
     max_steps: int,
-    model_path: Path,
-    norm_path: Path,
-    device: torch.device,
+    phase_horizon: int,
     env_id: str,
     sim_backend: str,
+    model: BCPolicy | None,
+    stats: dict[str, np.ndarray] | None,
+    device: torch.device,
+    expert_low: np.ndarray | None = None,
+    expert_high: np.ndarray | None = None,
+    hard_threshold_gripper: bool = False,
 ) -> dict[str, Any]:
     env = gym.make(
         env_id,
@@ -301,29 +343,25 @@ def evaluate_policy(
 
     set_env_time_limit(env, max_steps=max_steps)
 
-    model = None
-    stats = None
-
-    if policy_name == "bc":
-        model, stats = load_policy(
-            model_path=model_path,
-            norm_path=norm_path,
-            device=device,
-        )
-
     episodes: list[dict[str, Any]] = []
 
     for ep in range(num_episodes):
         seed = seed_start + ep
+
         result = run_episode(
             env=env,
             policy_name=policy_name,
             seed=seed,
             max_steps=max_steps,
+            phase_horizon=phase_horizon,
             model=model,
             stats=stats,
             device=device,
+            expert_low=expert_low,
+            expert_high=expert_high,
+            hard_threshold_gripper=hard_threshold_gripper,
         )
+
         result["episode"] = ep
         episodes.append(result)
 
@@ -344,11 +382,13 @@ def evaluate_policy(
         "num_episodes": num_episodes,
         "seed_start": seed_start,
         "max_steps": max_steps,
+        "phase_horizon": phase_horizon,
         "env_time_limit": env_time_limit,
         "success_rate_once": float(np.mean([x["success_once"] for x in episodes])),
         "final_success_rate": float(np.mean([x["final_success"] for x in episodes])),
         "mean_return": float(np.mean([x["return"] for x in episodes])),
         "mean_steps": float(np.mean([x["num_steps"] for x in episodes])),
+        "mean_action_norm": float(np.mean([x["mean_action_norm"] for x in episodes])),
         "episodes": episodes,
     }
 
@@ -356,13 +396,21 @@ def evaluate_policy(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-id", type=str, default="PickCube-v1")
-    parser.add_argument("--model", type=str, default="runs/m3_bc_state/best_model.pt")
-    parser.add_argument("--normalization", type=str, default="runs/m3_bc_state/normalization_stats.npz")
+    parser.add_argument("--model", type=str, default="runs/m3_bc_phase_aware/best_model.pt")
+    parser.add_argument("--normalization", type=str, default="runs/m3_bc_phase_aware/normalization_stats.npz")
     parser.add_argument("--num-episodes", type=int, default=30)
     parser.add_argument("--max-steps", type=int, default=120)
+    parser.add_argument("--phase-horizon", type=int, default=80)
     parser.add_argument("--seed", type=int, default=3000)
     parser.add_argument("--sim-backend", type=str, default="auto")
-    parser.add_argument("--out-dir", type=str, default="runs/m3_bc_state/closedloop_eval")
+    parser.add_argument("--out-dir", type=str, default="runs/m3_bc_phase_aware/closedloop_eval")
+    parser.add_argument(
+        "--expert-action-bounds",
+        type=str,
+        default="outputs/m3_phase_aware_dataset_100/action_bounds.json",
+    )
+    parser.add_argument("--expert-bound-margin", type=float, default=0.05)
+    parser.add_argument("--hard-threshold-gripper", action="store_true")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -370,65 +418,80 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = Path(args.model)
-    norm_path = Path(args.normalization)
-
-    if not model_path.exists():
-        raise FileNotFoundError(model_path)
-    if not norm_path.exists():
-        raise FileNotFoundError(norm_path)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model, stats = load_policy(
+        model_path=Path(args.model),
+        norm_path=Path(args.normalization),
+        device=device,
+    )
+
+    expert_low, expert_high = load_expert_action_bounds(
+        Path(args.expert_action_bounds),
+        margin=args.expert_bound_margin,
+    )
 
     random_summary = evaluate_policy(
         policy_name="random",
         num_episodes=args.num_episodes,
         seed_start=args.seed,
         max_steps=args.max_steps,
-        model_path=model_path,
-        norm_path=norm_path,
-        device=device,
+        phase_horizon=args.phase_horizon,
         env_id=args.env_id,
         sim_backend=args.sim_backend,
+        model=None,
+        stats=None,
+        device=device,
     )
 
-    bc_summary = evaluate_policy(
-        policy_name="bc",
+    phase_bc_summary = evaluate_policy(
+        policy_name="phase_bc",
         num_episodes=args.num_episodes,
         seed_start=args.seed,
         max_steps=args.max_steps,
-        model_path=model_path,
-        norm_path=norm_path,
-        device=device,
+        phase_horizon=args.phase_horizon,
         env_id=args.env_id,
         sim_backend=args.sim_backend,
+        model=model,
+        stats=stats,
+        device=device,
+        expert_low=expert_low,
+        expert_high=expert_high,
+        hard_threshold_gripper=args.hard_threshold_gripper,
     )
 
     summary = {
-        "milestone": "M3.2",
-        "description": "Closed-loop rollout evaluation for state-only BC policy.",
+        "milestone": "M3.5A",
+        "description": "Expert-bounded closed-loop rollout evaluation for phase-aware BC policy with fixed evaluation horizon.",
         "env_id": args.env_id,
         "control_mode": "pd_joint_pos",
         "obs_mode": "none",
-        "model": str(model_path),
-        "normalization": str(norm_path),
+        "model": str(args.model),
+        "normalization": str(args.normalization),
         "device": str(device),
         "num_episodes": args.num_episodes,
         "max_steps": args.max_steps,
+        "requested_max_steps": args.max_steps,
+        "phase_horizon": args.phase_horizon,
         "seed": args.seed,
+        "safe_action_filter": {
+            "expert_action_bounds": str(args.expert_action_bounds),
+            "expert_bound_margin": args.expert_bound_margin,
+            "hard_threshold_gripper": args.hard_threshold_gripper,
+        },
         "random": random_summary,
-        "bc": bc_summary,
+        "phase_bc": phase_bc_summary,
         "comparison": {
-            "success_rate_once_delta": bc_summary["success_rate_once"] - random_summary["success_rate_once"],
-            "final_success_rate_delta": bc_summary["final_success_rate"] - random_summary["final_success_rate"],
-            "mean_return_delta": bc_summary["mean_return"] - random_summary["mean_return"],
+            "success_rate_once_delta": phase_bc_summary["success_rate_once"] - random_summary["success_rate_once"],
+            "final_success_rate_delta": phase_bc_summary["final_success_rate"] - random_summary["final_success_rate"],
+            "mean_return_delta": phase_bc_summary["mean_return"] - random_summary["mean_return"],
         },
     }
 
     with (out_dir / "closedloop_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print("[done] M3.2 closed-loop evaluation complete")
+    print("[done] M3.5A phase-aware closed-loop evaluation complete")
     print(json.dumps(summary["comparison"], indent=2))
 
 

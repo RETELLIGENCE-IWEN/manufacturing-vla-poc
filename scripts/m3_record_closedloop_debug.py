@@ -72,6 +72,44 @@ def get_state_dict(env: gym.Env) -> dict[str, Any]:
     raise RuntimeError("Could not find get_state_dict() on env.")
 
 
+def set_env_time_limit(env: gym.Env, max_steps: int) -> None:
+    """
+    Override ManiSkill/Gymnasium TimeLimitWrapper horizon.
+
+    ManiSkill PickCube-v1 may wrap the environment with an internal
+    TimeLimitWrapper whose _max_episode_steps defaults to 50. This can
+    prematurely truncate closed-loop policy evaluation even when the
+    script-level --max-steps argument is larger.
+
+    This helper aligns the wrapper time limit with the requested rollout
+    horizon.
+    """
+    if max_steps <= 0:
+        raise ValueError(f"max_steps must be positive, got {max_steps}")
+
+    candidates = [
+        env,
+        getattr(env, "unwrapped", None),
+        getattr(env, "base_env", None),
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        if hasattr(candidate, "_max_episode_steps"):
+            try:
+                candidate._max_episode_steps = int(max_steps)
+            except Exception:
+                pass
+
+        if hasattr(candidate, "max_episode_steps"):
+            try:
+                candidate.max_episode_steps = int(max_steps)
+            except Exception:
+                pass
+
+
 def squeeze_first_batch(x: Any) -> np.ndarray:
     arr = to_numpy(x).astype(np.float32)
 
@@ -201,6 +239,8 @@ def main() -> None:
         sim_backend="auto",
     )
 
+    set_env_time_limit(env, max_steps=args.max_steps)
+
     if args.save_video:
         env = RecordEpisode(
             env,
@@ -276,6 +316,8 @@ def main() -> None:
             if scalar_bool(terminated) or scalar_bool(truncated):
                 break
 
+    env_time_limit = int(getattr(env, "_max_episode_steps", args.max_steps))
+
     if args.save_video:
         env.flush_trajectory()
         env.flush_video()
@@ -289,6 +331,8 @@ def main() -> None:
         "env_id": args.env_id,
         "seed": args.seed,
         "max_steps": args.max_steps,
+        "requested_max_steps": args.max_steps,
+        "env_time_limit": env_time_limit,
         "num_steps": len(rewards),
         "return": float(np.sum(rewards)),
         "success_once": bool(any(success_flags)),
