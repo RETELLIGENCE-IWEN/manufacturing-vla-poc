@@ -14,7 +14,13 @@ import torch.nn as nn
 
 
 class BCPolicy(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dims: list[int], dropout: float) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dims: list[int],
+        dropout: float,
+    ) -> None:
         super().__init__()
 
         layers: list[nn.Module] = []
@@ -55,29 +61,13 @@ def scalar_float(x: Any) -> float:
     return float(np.asarray(to_numpy(x), dtype=np.float64).mean())
 
 
-def get_state_dict(env: gym.Env) -> dict[str, Any]:
-    candidates = [env, getattr(env, "unwrapped", None), getattr(env, "base_env", None)]
-
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        if hasattr(candidate, "get_state_dict"):
-            return candidate.get_state_dict()
-
-    raise RuntimeError("Could not find get_state_dict() on env.")
-
-
 def set_env_time_limit(env: gym.Env, max_steps: int) -> None:
     """
-    Override ManiSkill/Gymnasium TimeLimitWrapper horizon.
+    Override ManiSkill TimeLimitWrapper horizon.
 
-    ManiSkill PickCube-v1 may wrap the environment with an internal
-    TimeLimitWrapper whose _max_episode_steps defaults to 50. This can
-    prematurely truncate closed-loop policy evaluation even when the
-    script-level --max-steps argument is larger.
-
-    This helper aligns the wrapper time limit with the requested rollout
-    horizon.
+    PickCube-v1 may be wrapped with _max_episode_steps=50.
+    This function aligns that internal horizon with the requested
+    evaluation horizon.
     """
     if max_steps <= 0:
         raise ValueError(f"max_steps must be positive, got {max_steps}")
@@ -92,17 +82,48 @@ def set_env_time_limit(env: gym.Env, max_steps: int) -> None:
         if candidate is None:
             continue
 
-        if hasattr(candidate, "_max_episode_steps"):
-            try:
-                candidate._max_episode_steps = int(max_steps)
-            except Exception:
-                pass
+        # Avoid touching max_episode_steps property because Gymnasium may warn.
+        if "_max_episode_steps" in vars(candidate):
+            candidate._max_episode_steps = int(max_steps)
 
-        if hasattr(candidate, "max_episode_steps"):
-            try:
-                candidate.max_episode_steps = int(max_steps)
-            except Exception:
-                pass
+
+def get_env_time_limit(env: gym.Env, fallback: int) -> int:
+    candidates = [
+        env,
+        getattr(env, "unwrapped", None),
+        getattr(env, "base_env", None),
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if "_max_episode_steps" in vars(candidate):
+            value = getattr(candidate, "_max_episode_steps")
+            if value is not None:
+                return int(value)
+
+    return int(fallback)
+
+
+def get_state_dict(env: gym.Env) -> dict[str, Any]:
+    """
+    Get ManiSkill state dict.
+
+    Prefer unwrapped/base_env first to avoid Gymnasium wrapper warnings.
+    """
+    candidates = [
+        getattr(env, "unwrapped", None),
+        getattr(env, "base_env", None),
+        env,
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if hasattr(candidate, "get_state_dict"):
+            return candidate.get_state_dict()
+
+    raise RuntimeError("Could not find get_state_dict() on env.")
 
 
 def squeeze_first_batch(x: Any) -> np.ndarray:
@@ -114,19 +135,49 @@ def squeeze_first_batch(x: Any) -> np.ndarray:
     return arr.reshape(-1).astype(np.float32)
 
 
-def build_state_obs_from_env(env: gym.Env) -> np.ndarray:
+def extract_state_features(env: gym.Env) -> dict[str, np.ndarray]:
+    """
+    Build the M3/M3.4 live state layout.
+
+    state_obs = panda articulation state + cube actor state + goal_site actor state
+    state_obs dim = 31 + 13 + 13 = 57
+    """
     state = get_state_dict(env)
 
-    panda = squeeze_first_batch(state["articulations"]["panda"])
-    cube = squeeze_first_batch(state["actors"]["cube"])
-    goal_site = squeeze_first_batch(state["actors"]["goal_site"])
+    try:
+        panda = squeeze_first_batch(state["articulations"]["panda"])
+        cube = squeeze_first_batch(state["actors"]["cube"])
+        goal_site = squeeze_first_batch(state["actors"]["goal_site"])
+    except KeyError as exc:
+        available = {
+            "top_level": list(state.keys()),
+            "actors": list(state.get("actors", {}).keys())
+            if isinstance(state.get("actors", {}), dict)
+            else None,
+            "articulations": list(state.get("articulations", {}).keys())
+            if isinstance(state.get("articulations", {}), dict)
+            else None,
+        }
+        raise KeyError(f"Missing expected state key: {exc}. Available keys: {available}") from exc
 
-    obs = np.concatenate([panda, cube, goal_site], axis=0).astype(np.float32)
+    state_obs = np.concatenate([panda, cube, goal_site], axis=0).astype(np.float32)
 
-    if obs.shape[0] != 57:
-        raise ValueError(f"Unexpected state obs dim: {obs.shape[0]}, expected 57")
+    if state_obs.shape[0] != 57:
+        raise ValueError(f"Unexpected state obs dim: {state_obs.shape[0]}, expected 57")
 
-    return obs
+    cube_pos = cube[:3].astype(np.float32)
+    goal_pos = goal_site[:3].astype(np.float32)
+    cube_goal_dist = np.asarray([np.linalg.norm(cube_pos - goal_pos)], dtype=np.float32)
+
+    return {
+        "state_obs": state_obs,
+        "panda": panda,
+        "cube": cube,
+        "goal_site": goal_site,
+        "cube_pos": cube_pos,
+        "goal_pos": goal_pos,
+        "cube_goal_dist": cube_goal_dist,
+    }
 
 
 def build_phase_obs(
@@ -134,22 +185,32 @@ def build_phase_obs(
     step_idx: int,
     phase_horizon: int,
     prev_action: np.ndarray,
-) -> np.ndarray:
-    state_obs = build_state_obs_from_env(env)
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """
+    Build phase-aware observation.
+
+    obs = state_57 + progress_1 + prev_action_8
+    total dim = 66
+    """
+    features = extract_state_features(env)
 
     denom = max(1, phase_horizon - 1)
     progress_value = min(float(step_idx) / float(denom), 1.0)
     progress = np.asarray([progress_value], dtype=np.float32)
 
+    prev_action = prev_action.astype(np.float32).reshape(-1)
+    if prev_action.shape[0] != 8:
+        raise ValueError(f"Unexpected prev_action dim: {prev_action.shape[0]}, expected 8")
+
     obs = np.concatenate(
-        [state_obs, progress, prev_action.astype(np.float32).reshape(-1)],
+        [features["state_obs"], progress, prev_action],
         axis=0,
     ).astype(np.float32)
 
     if obs.shape[0] != 66:
         raise ValueError(f"Unexpected phase-aware obs dim: {obs.shape[0]}, expected 66")
 
-    return obs
+    return obs, features
 
 
 def load_policy(
@@ -196,7 +257,7 @@ def predict_action(
     return action.astype(np.float32)
 
 
-def clip_action(env: gym.Env, action: np.ndarray) -> np.ndarray:
+def clip_action_to_env(env: gym.Env, action: np.ndarray) -> np.ndarray:
     low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     action = action.reshape(-1).astype(np.float32)
@@ -206,12 +267,19 @@ def clip_action(env: gym.Env, action: np.ndarray) -> np.ndarray:
 
     return action.astype(np.float32)
 
+
 def load_expert_action_bounds(path: Path, margin: float) -> tuple[np.ndarray, np.ndarray]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+
     with path.open("r", encoding="utf-8") as f:
         bounds = json.load(f)
 
     low = np.asarray(bounds["min"], dtype=np.float32)
     high = np.asarray(bounds["max"], dtype=np.float32)
+
+    if low.shape != high.shape:
+        raise ValueError(f"Action bound shape mismatch: low={low.shape}, high={high.shape}")
 
     span = high - low
     low = low - margin * span
@@ -226,16 +294,51 @@ def apply_safe_action_filter(
     expert_high: np.ndarray,
     hard_threshold_gripper: bool,
 ) -> np.ndarray:
+    """
+    Keep policy actions inside the expert action distribution.
+
+    This is a diagnostic/safety filter:
+    - clip all channels to expert min/max range
+    - optionally force the last gripper-like dimension to {-1, +1}
+    """
     action = action.reshape(-1).astype(np.float32)
 
-    # Clip all dimensions to expert distribution range.
+    if action.shape != expert_low.shape or action.shape != expert_high.shape:
+        raise ValueError(
+            f"Action/bound shape mismatch: action={action.shape}, "
+            f"low={expert_low.shape}, high={expert_high.shape}"
+        )
+
     action = np.clip(action, expert_low, expert_high).astype(np.float32)
 
-    # Treat the last action dimension as gripper-like open/close command.
     if hard_threshold_gripper:
         action[-1] = 1.0 if action[-1] >= 0.0 else -1.0
 
     return action.astype(np.float32)
+
+
+def read_info_flag(info: Any, key: str) -> bool:
+    if isinstance(info, dict) and key in info:
+        return scalar_bool(info[key])
+    return False
+
+
+def should_activate_final_hold(
+    hold_trigger: str,
+    cube_goal_dist: float,
+    hold_dist_threshold: float,
+    is_obj_placed_latched: bool,
+) -> bool:
+    distance_triggered = cube_goal_dist <= hold_dist_threshold
+
+    if hold_trigger == "distance":
+        return distance_triggered
+    if hold_trigger == "placed":
+        return is_obj_placed_latched
+    if hold_trigger == "distance_or_placed":
+        return distance_triggered or is_obj_placed_latched
+
+    raise ValueError(f"Unsupported hold_trigger: {hold_trigger}")
 
 
 def run_episode(
@@ -250,23 +353,41 @@ def run_episode(
     expert_low: np.ndarray | None = None,
     expert_high: np.ndarray | None = None,
     hard_threshold_gripper: bool = False,
+    enable_final_hold: bool = False,
+    hold_dist_threshold: float = 0.05,
+    hold_trigger: str = "distance_or_placed",
 ) -> dict[str, Any]:
     env.reset(seed=seed)
 
     rewards: list[float] = []
     success_flags: list[bool] = []
+    is_grasped_flags: list[bool] = []
+    is_obj_placed_flags: list[bool] = []
+    is_robot_static_flags: list[bool] = []
+    truncated_flags: list[bool] = []
+    terminated_flags: list[bool] = []
     action_norms: list[float] = []
+    cube_goal_dists: list[float] = []
+    final_hold_used_flags: list[bool] = []
 
     prev_action = np.zeros((8,), dtype=np.float32)
 
+    final_hold_active = False
+    final_hold_activation_step: int | None = None
+    is_obj_placed_latched = False
+
     for t in range(max_steps):
+        used_final_hold_this_step = False
+
         if policy_name == "random":
             action = env.action_space.sample()
+            features = extract_state_features(env)
+
         elif policy_name == "phase_bc":
             if model is None or stats is None:
                 raise RuntimeError("phase_bc requested but model/stats are missing.")
 
-            obs = build_phase_obs(
+            obs, features = build_phase_obs(
                 env=env,
                 step_idx=t,
                 phase_horizon=phase_horizon,
@@ -279,6 +400,7 @@ def run_episode(
                 obs_raw=obs,
                 device=device,
             )
+
             if expert_low is not None and expert_high is not None:
                 action = apply_safe_action_filter(
                     action=action,
@@ -287,7 +409,29 @@ def run_episode(
                     hard_threshold_gripper=hard_threshold_gripper,
                 )
 
-            action = clip_action(env, action)
+            cube_goal_dist_before_action = float(features["cube_goal_dist"][0])
+
+            if enable_final_hold:
+                hold_now = final_hold_active or should_activate_final_hold(
+                    hold_trigger=hold_trigger,
+                    cube_goal_dist=cube_goal_dist_before_action,
+                    hold_dist_threshold=hold_dist_threshold,
+                    is_obj_placed_latched=is_obj_placed_latched,
+                )
+
+                if hold_now:
+                    if not final_hold_active:
+                        final_hold_activation_step = t
+                    final_hold_active = True
+                    used_final_hold_this_step = True
+
+                    # For pd_joint_pos, holding the previous joint target is safer
+                    # than zeroing the action. This attempts to prevent the policy
+                    # from continuing to push the cube after near-placement.
+                    action = prev_action.copy()
+
+            action = clip_action_to_env(env, action)
+
         else:
             raise ValueError(f"Unknown policy: {policy_name}")
 
@@ -295,15 +439,36 @@ def run_episode(
 
         prev_action = np.asarray(action, dtype=np.float32).reshape(-1)
 
-        rewards.append(scalar_float(reward))
-        action_norms.append(float(np.linalg.norm(prev_action)))
+        reward_value = scalar_float(reward)
+        term_value = scalar_bool(terminated)
+        trunc_value = scalar_bool(truncated)
 
-        success = False
-        if isinstance(info, dict) and "success" in info:
-            success = scalar_bool(info["success"])
+        success = read_info_flag(info, "success")
+        is_grasped = read_info_flag(info, "is_grasped")
+        is_obj_placed = read_info_flag(info, "is_obj_placed")
+        is_robot_static = read_info_flag(info, "is_robot_static")
+
+        if enable_final_hold and is_obj_placed:
+            if hold_trigger in ["placed", "distance_or_placed"]:
+                is_obj_placed_latched = True
+                if not final_hold_active:
+                    # This will be applied from the next step.
+                    final_hold_activation_step = t + 1
+                    final_hold_active = True
+
+        rewards.append(reward_value)
+        terminated_flags.append(term_value)
+        truncated_flags.append(trunc_value)
         success_flags.append(success)
+        is_grasped_flags.append(is_grasped)
+        is_obj_placed_flags.append(is_obj_placed)
+        is_robot_static_flags.append(is_robot_static)
+        final_hold_used_flags.append(used_final_hold_this_step)
 
-        if scalar_bool(terminated) or scalar_bool(truncated):
+        action_norms.append(float(np.linalg.norm(prev_action)))
+        cube_goal_dists.append(float(features["cube_goal_dist"][0]))
+
+        if term_value or trunc_value:
             break
 
     return {
@@ -313,9 +478,40 @@ def run_episode(
         "return": float(np.sum(rewards)),
         "success_once": bool(any(success_flags)),
         "final_success": bool(success_flags[-1]) if success_flags else False,
+        "grasped_once": bool(any(is_grasped_flags)),
+        "placed_once": bool(any(is_obj_placed_flags)),
+        "robot_static_once": bool(any(is_robot_static_flags)),
+        "final_is_grasped": bool(is_grasped_flags[-1]) if is_grasped_flags else False,
+        "final_is_obj_placed": bool(is_obj_placed_flags[-1]) if is_obj_placed_flags else False,
+        "final_is_robot_static": bool(is_robot_static_flags[-1]) if is_robot_static_flags else False,
+        "terminated_once": bool(any(terminated_flags)),
+        "truncated_once": bool(any(truncated_flags)),
+        "final_terminated": bool(terminated_flags[-1]) if terminated_flags else False,
+        "final_truncated": bool(truncated_flags[-1]) if truncated_flags else False,
         "mean_action_norm": float(np.mean(action_norms)) if action_norms else 0.0,
         "max_action_norm": float(np.max(action_norms)) if action_norms else 0.0,
+        "initial_cube_goal_dist": float(cube_goal_dists[0]) if cube_goal_dists else None,
+        "final_cube_goal_dist": float(cube_goal_dists[-1]) if cube_goal_dists else None,
+        "min_cube_goal_dist": float(np.min(cube_goal_dists)) if cube_goal_dists else None,
+        "final_hold_active": bool(final_hold_active),
+        "final_hold_used_once": bool(any(final_hold_used_flags)),
+        "final_hold_step_count": int(np.sum(final_hold_used_flags)) if final_hold_used_flags else 0,
+        "final_hold_activation_step": final_hold_activation_step,
     }
+
+
+def aggregate_bool_rate(episodes: list[dict[str, Any]], key: str) -> float:
+    return float(np.mean([bool(x[key]) for x in episodes])) if episodes else 0.0
+
+
+def aggregate_float_mean(episodes: list[dict[str, Any]], key: str) -> float:
+    values = [x[key] for x in episodes if x.get(key) is not None]
+    return float(np.mean(values)) if values else 0.0
+
+
+def aggregate_int_mean(episodes: list[dict[str, Any]], key: str) -> float:
+    values = [int(x[key]) for x in episodes if x.get(key) is not None]
+    return float(np.mean(values)) if values else 0.0
 
 
 def evaluate_policy(
@@ -332,6 +528,9 @@ def evaluate_policy(
     expert_low: np.ndarray | None = None,
     expert_high: np.ndarray | None = None,
     hard_threshold_gripper: bool = False,
+    enable_final_hold: bool = False,
+    hold_dist_threshold: float = 0.05,
+    hold_trigger: str = "distance_or_placed",
 ) -> dict[str, Any]:
     env = gym.make(
         env_id,
@@ -342,6 +541,7 @@ def evaluate_policy(
     )
 
     set_env_time_limit(env, max_steps=max_steps)
+    env_time_limit = get_env_time_limit(env, fallback=max_steps)
 
     episodes: list[dict[str, Any]] = []
 
@@ -360,6 +560,9 @@ def evaluate_policy(
             expert_low=expert_low,
             expert_high=expert_high,
             hard_threshold_gripper=hard_threshold_gripper,
+            enable_final_hold=enable_final_hold,
+            hold_dist_threshold=hold_dist_threshold,
+            hold_trigger=hold_trigger,
         )
 
         result["episode"] = ep
@@ -369,12 +572,14 @@ def evaluate_policy(
             f"[{policy_name} ep={ep:03d}] "
             f"seed={seed} "
             f"success_once={result['success_once']} "
-            f"final_success={result['final_success']} "
+            f"grasped_once={result['grasped_once']} "
+            f"placed_once={result['placed_once']} "
+            f"final_static={result['final_is_robot_static']} "
+            f"final_hold={result['final_hold_used_once']} "
             f"return={result['return']:.3f} "
             f"steps={result['num_steps']}"
         )
 
-    env_time_limit = int(getattr(env, "_max_episode_steps", max_steps))
     env.close()
 
     return {
@@ -382,13 +587,27 @@ def evaluate_policy(
         "num_episodes": num_episodes,
         "seed_start": seed_start,
         "max_steps": max_steps,
-        "phase_horizon": phase_horizon,
         "env_time_limit": env_time_limit,
-        "success_rate_once": float(np.mean([x["success_once"] for x in episodes])),
-        "final_success_rate": float(np.mean([x["final_success"] for x in episodes])),
-        "mean_return": float(np.mean([x["return"] for x in episodes])),
-        "mean_steps": float(np.mean([x["num_steps"] for x in episodes])),
-        "mean_action_norm": float(np.mean([x["mean_action_norm"] for x in episodes])),
+        "phase_horizon": phase_horizon,
+        "success_rate_once": aggregate_bool_rate(episodes, "success_once"),
+        "final_success_rate": aggregate_bool_rate(episodes, "final_success"),
+        "grasped_once_rate": aggregate_bool_rate(episodes, "grasped_once"),
+        "placed_once_rate": aggregate_bool_rate(episodes, "placed_once"),
+        "robot_static_once_rate": aggregate_bool_rate(episodes, "robot_static_once"),
+        "final_grasped_rate": aggregate_bool_rate(episodes, "final_is_grasped"),
+        "final_placed_rate": aggregate_bool_rate(episodes, "final_is_obj_placed"),
+        "final_robot_static_rate": aggregate_bool_rate(episodes, "final_is_robot_static"),
+        "terminated_once_rate": aggregate_bool_rate(episodes, "terminated_once"),
+        "truncated_once_rate": aggregate_bool_rate(episodes, "truncated_once"),
+        "final_hold_once_rate": aggregate_bool_rate(episodes, "final_hold_used_once"),
+        "mean_final_hold_step_count": aggregate_int_mean(episodes, "final_hold_step_count"),
+        "mean_return": aggregate_float_mean(episodes, "return"),
+        "mean_steps": aggregate_float_mean(episodes, "num_steps"),
+        "mean_action_norm": aggregate_float_mean(episodes, "mean_action_norm"),
+        "max_action_norm": float(np.max([x["max_action_norm"] for x in episodes])) if episodes else 0.0,
+        "mean_initial_cube_goal_dist": aggregate_float_mean(episodes, "initial_cube_goal_dist"),
+        "mean_final_cube_goal_dist": aggregate_float_mean(episodes, "final_cube_goal_dist"),
+        "mean_min_cube_goal_dist": aggregate_float_mean(episodes, "min_cube_goal_dist"),
         "episodes": episodes,
     }
 
@@ -403,7 +622,7 @@ def main() -> None:
     parser.add_argument("--phase-horizon", type=int, default=80)
     parser.add_argument("--seed", type=int, default=3000)
     parser.add_argument("--sim-backend", type=str, default="auto")
-    parser.add_argument("--out-dir", type=str, default="runs/m3_bc_phase_aware/closedloop_eval")
+    parser.add_argument("--out-dir", type=str, default="runs/m3_bc_phase_aware/closedloop_eval_safe")
     parser.add_argument(
         "--expert-action-bounds",
         type=str,
@@ -411,6 +630,16 @@ def main() -> None:
     )
     parser.add_argument("--expert-bound-margin", type=float, default=0.05)
     parser.add_argument("--hard-threshold-gripper", action="store_true")
+
+    parser.add_argument("--enable-final-hold", action="store_true")
+    parser.add_argument("--hold-dist-threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--hold-trigger",
+        type=str,
+        default="distance_or_placed",
+        choices=["distance", "placed", "distance_or_placed"],
+    )
+
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -420,14 +649,25 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    model_path = Path(args.model)
+    norm_path = Path(args.normalization)
+    bounds_path = Path(args.expert_action_bounds)
+
+    if not model_path.exists():
+        raise FileNotFoundError(model_path)
+    if not norm_path.exists():
+        raise FileNotFoundError(norm_path)
+    if not bounds_path.exists():
+        raise FileNotFoundError(bounds_path)
+
     model, stats = load_policy(
-        model_path=Path(args.model),
-        norm_path=Path(args.normalization),
+        model_path=model_path,
+        norm_path=norm_path,
         device=device,
     )
 
     expert_low, expert_high = load_expert_action_bounds(
-        Path(args.expert_action_bounds),
+        bounds_path,
         margin=args.expert_bound_margin,
     )
 
@@ -442,6 +682,12 @@ def main() -> None:
         model=None,
         stats=None,
         device=device,
+        expert_low=None,
+        expert_high=None,
+        hard_threshold_gripper=False,
+        enable_final_hold=False,
+        hold_dist_threshold=args.hold_dist_threshold,
+        hold_trigger=args.hold_trigger,
     )
 
     phase_bc_summary = evaluate_policy(
@@ -458,40 +704,61 @@ def main() -> None:
         expert_low=expert_low,
         expert_high=expert_high,
         hard_threshold_gripper=args.hard_threshold_gripper,
+        enable_final_hold=args.enable_final_hold,
+        hold_dist_threshold=args.hold_dist_threshold,
+        hold_trigger=args.hold_trigger,
     )
 
     summary = {
-        "milestone": "M3.5A",
-        "description": "Expert-bounded closed-loop rollout evaluation for phase-aware BC policy with fixed evaluation horizon.",
+        "milestone": "M3.6A",
+        "description": (
+            "Expert-bounded phase-aware BC closed-loop evaluation with fixed horizon, "
+            "success-condition decomposition, and optional final hold stabilization."
+        ),
         "env_id": args.env_id,
         "control_mode": "pd_joint_pos",
         "obs_mode": "none",
-        "model": str(args.model),
-        "normalization": str(args.normalization),
+        "model": str(model_path),
+        "normalization": str(norm_path),
         "device": str(device),
         "num_episodes": args.num_episodes,
-        "max_steps": args.max_steps,
         "requested_max_steps": args.max_steps,
         "phase_horizon": args.phase_horizon,
         "seed": args.seed,
         "safe_action_filter": {
-            "expert_action_bounds": str(args.expert_action_bounds),
+            "expert_action_bounds": str(bounds_path),
             "expert_bound_margin": args.expert_bound_margin,
             "hard_threshold_gripper": args.hard_threshold_gripper,
+        },
+        "final_hold_wrapper": {
+            "enabled": args.enable_final_hold,
+            "hold_dist_threshold": args.hold_dist_threshold,
+            "hold_trigger": args.hold_trigger,
+            "mode": "previous_action_hold",
         },
         "random": random_summary,
         "phase_bc": phase_bc_summary,
         "comparison": {
             "success_rate_once_delta": phase_bc_summary["success_rate_once"] - random_summary["success_rate_once"],
             "final_success_rate_delta": phase_bc_summary["final_success_rate"] - random_summary["final_success_rate"],
+            "grasped_once_rate_delta": phase_bc_summary["grasped_once_rate"] - random_summary["grasped_once_rate"],
+            "placed_once_rate_delta": phase_bc_summary["placed_once_rate"] - random_summary["placed_once_rate"],
+            "final_robot_static_rate_delta": phase_bc_summary["final_robot_static_rate"] - random_summary["final_robot_static_rate"],
+            "final_hold_once_rate_delta": phase_bc_summary["final_hold_once_rate"] - random_summary["final_hold_once_rate"],
             "mean_return_delta": phase_bc_summary["mean_return"] - random_summary["mean_return"],
+            "mean_final_cube_goal_dist_delta": (
+                phase_bc_summary["mean_final_cube_goal_dist"] - random_summary["mean_final_cube_goal_dist"]
+            ),
+            "mean_min_cube_goal_dist_delta": (
+                phase_bc_summary["mean_min_cube_goal_dist"] - random_summary["mean_min_cube_goal_dist"]
+            ),
         },
     }
 
     with (out_dir / "closedloop_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print("[done] M3.5A phase-aware closed-loop evaluation complete")
+    print("[done] M3.6A final-hold evaluation complete")
     print(json.dumps(summary["comparison"], indent=2))
 
 
