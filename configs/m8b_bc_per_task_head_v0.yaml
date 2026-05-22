@@ -1,0 +1,39 @@
+dataset_dir: outputs/m6_multitask_vla_dataset_v2
+run_dir: runs/m8b_bc_per_task_head_v0
+
+seed: 42
+
+training:
+  batch_size: 256
+  num_epochs: 500
+  learning_rate: 0.0003
+  weight_decay: 0.000001
+  grad_clip_norm: 1.0
+
+model:
+  hidden_dims: [256, 256, 128]
+  activation: relu
+  dropout: 0.05
+
+loss:
+  early_end: 0.35
+  mid_end: 0.65
+  early_weight: 1.0
+  mid_weight: 2.0
+  late_weight: 8.0
+  normalize_phase_weights: true
+  use_dataset_sample_weight: true
+  normalize_total_weights: false
+  gripper_weight: 1.0
+
+lang:
+  lang_proj_dim: 64
+
+image:
+  image_proj_dim: 128
+
+aux:
+  aux_weight: 1.0
+
+logging:
+  print_every_epochs: 25
