@@ -1,0 +1,43 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#ffffff', 'primaryBorderColor': '#444', 'lineColor': '#666', 'fontSize': '12px' } } }%%
+flowchart LR
+    subgraph INPUTS["Inputs (per step)"]
+        direction TB
+        S["state_obs (57)<br/>panda 31 + cube 13 + goal 13"]
+        P["progress (1)<br/>prev_action (8)"]
+        I["instruction (text)"]
+        IM["RGB image (224×224)"]
+    end
+
+    subgraph FROZEN["Frozen encoders"]
+        direction TB
+        CT["CLIP text<br/>pooler → 512"]
+        CV["CLIP vision<br/>pooler → 768"]
+    end
+
+    subgraph TRAINABLE["Trainable head (~300k params)"]
+        direction TB
+        LP["lang_proj<br/>512 → 64"]
+        IP["image_proj<br/>768 → 128"]
+        CC["concat → 258"]
+        TR["MLP trunk"]
+        AH["Action head<br/>(BC / Diffusion U-Net / Per-task head)"]
+        TC["Task head<br/>(aux CE on lang_proj)"]
+    end
+
+    A["action (8)<br/>pd_joint_pos"]
+
+    S --> CC
+    P --> CC
+    I --> CT --> LP --> CC
+    LP --> TC
+    IM --> CV --> IP --> CC
+    CC --> TR --> AH --> A
+
+    classDef inp fill:#fafafa,stroke:#888;
+    classDef froz fill:#eef2ff,stroke:#445;
+    classDef trn fill:#fff7e6,stroke:#a60;
+    classDef out fill:#e8f5e9,stroke:#286;
+    class S,P,I,IM inp;
+    class CT,CV froz;
+    class LP,IP,CC,TR,AH,TC trn;
+    class A out;

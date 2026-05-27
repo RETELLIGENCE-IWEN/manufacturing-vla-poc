@@ -1,0 +1,10 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'fontSize': '12px' } } }%%
+flowchart TB
+    M["Trained policy<br/>(BC / Diffusion / PCGrad / PerTaskHead)"]
+    M --> SM["Swap matrix<br/>3 env × 2 instructions = 6 cells"]
+    SM --> R["30 episodes / cell<br/>seed=3000, phase_horizon=80, max_steps=120"]
+    R --> SF["Safe action filter<br/>(expert action bounds)"]
+    SF --> FH["Optional: final-hold,<br/>force_grip heuristic"]
+    FH --> MET["Metrics<br/>success / grasped / placed / mean_return<br/>min_cube_goal_dist / xy_sustained_*_10"]
+    MET --> VID["Debug video<br/>+ per-step CSV log"]
+    VID --> DIAG["Failure diagnosis<br/>→ next milestone"]

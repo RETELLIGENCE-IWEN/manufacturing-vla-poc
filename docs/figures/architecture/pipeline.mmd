@@ -1,0 +1,56 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#ffffff', 'primaryBorderColor': '#444', 'lineColor': '#666', 'fontSize': '13px' } } }%%
+flowchart LR
+    subgraph M0_M1["M0–M1 · 환경 + 언어 task wrapper"]
+        direction TB
+        D[("Docker<br/>ManiSkill + CUDA")]
+        ENV["PickCube / PushCube / PullCube<br/>+ instruction metadata"]
+        D --> ENV
+    end
+
+    subgraph M2["M2 · Expert demos + dataset"]
+        direction TB
+        MP["Motion-planning expert<br/>(project-local solver)"]
+        DS["Step-level NPZ dataset<br/>obs=57, action=8"]
+        MP --> DS
+    end
+
+    subgraph M3["M3 · BC ladder (PickCube)"]
+        direction TB
+        BC1["State-only BC"]
+        BC2["+ phase-aware<br/>(progress, prev_action)"]
+        BC3["+ DAgger v1<br/>+ force_grip heuristic"]
+        BC1 --> BC2 --> BC3
+    end
+
+    subgraph M4_M5["M4–M5.1 · Language conditioning"]
+        direction TB
+        L1["M4: + CLIP text<br/>(single task)"]
+        L2["M5: multi-task BC"]
+        L3["M5.1: + aux task_id CE<br/>(instruction becomes load-bearing)"]
+        L1 --> L2 --> L3
+    end
+
+    subgraph M6["M6 · VLA (state + text + vision)"]
+        direction TB
+        V0["M6 v0: + CLIP vision"]
+        V1["M6.1: PushCube settle solver<br/>+ late_weight 8"]
+        V2["M6.2: PullCube settle<br/>+ xy / sustained metrics"]
+        V0 --> V1 --> V2
+    end
+
+    subgraph M7["M7 · Diffusion Policy"]
+        DP["1D U-Net + DDPM eps<br/>+ DDIM receding-horizon"]
+    end
+
+    subgraph M8["M8 · 4-way capacity study"]
+        direction TB
+        C1["BC v2"]
+        C2["Diffusion (M7.1)"]
+        C3["PCGrad (M8a)"]
+        C4["Per-task heads (M8b)"]
+    end
+
+    M0_M1 --> M2 --> M3 --> M4_M5 --> M6 --> M7 --> M8
+
+    classDef milestone fill:#f7f7f9,stroke:#444,stroke-width:1px;
+    class M0_M1,M2,M3,M4_M5,M6,M7,M8 milestone;

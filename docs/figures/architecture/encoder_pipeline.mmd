@@ -1,0 +1,39 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'fontSize': '12px' } } }%%
+flowchart LR
+    subgraph OFFLINE["Offline preprocessing (one-shot, per dataset)"]
+        direction TB
+        D1[("episodes.jsonl<br/>instruction strings")]
+        D2[("expert .h5<br/>actions + seed")]
+        TXT["CLIPTokenizer +<br/>CLIPTextModel<br/>(frozen, openai/clip-vit-base-patch32)"]
+        DET["Deterministic env.reset(seed)<br/>+ step replay → RGB 224×224"]
+        VIS["CLIPImageProcessor +<br/>CLIPVisionModel<br/>(frozen, same model)"]
+        CACHE_L[("lang_emb<br/>512-dim · per episode")]
+        CACHE_I[("image_emb<br/>768-dim · per step")]
+        D1 --> TXT --> CACHE_L
+        D2 --> DET --> VIS --> CACHE_I
+    end
+
+    subgraph ONLINE["Online inference (every closed-loop episode)"]
+        direction TB
+        ENC1["instruction string"]
+        TXT2["CLIPTextModel (1× per episode)"]
+        STATE["state_obs(57)<br/>+ progress(1)<br/>+ prev_action(8)"]
+        FRAME["env.render() RGB 224×224"]
+        VIS2["CLIPVisionModel (1× per step)"]
+        POL["VLA policy head (trained, ~0.30M params)"]
+        ACT["action (8) → pd_joint_pos"]
+        ENC1 --> TXT2
+        TXT2 -- "lang_emb 512" --> POL
+        STATE --> POL
+        FRAME --> VIS2 -- "image_emb 768" --> POL
+        POL --> ACT
+    end
+
+    OFFLINE -. "encoders re-used at inference, never fine-tuned" .-> ONLINE
+
+    classDef froz fill:#eef2ff,stroke:#445,stroke-width:1px;
+    classDef cache fill:#f5fff0,stroke:#286;
+    classDef trn fill:#fff7e6,stroke:#a60;
+    class TXT,VIS,TXT2,VIS2 froz;
+    class CACHE_L,CACHE_I cache;
+    class POL trn;
